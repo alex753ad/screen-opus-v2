@@ -11,15 +11,17 @@ from statsmodels.regression.linear_model import OLS
 import warnings
 warnings.filterwarnings('ignore')
 
-# Импорт модуля mean reversion analysis v6.0 (DFA + FDR + Stability + Trade Score)
+# Импорт модуля mean reversion analysis v7.0
 from mean_reversion_analysis import (
     calculate_hurst_exponent,
     calculate_rolling_zscore,
     calculate_ou_parameters,
     calculate_ou_score,
     calculate_trade_score,
+    calculate_confidence,
     apply_fdr_correction,
     check_cointegration_stability,
+    adf_test_spread,
     estimate_exit_time,
     validate_ou_quality
 )
@@ -242,12 +244,9 @@ class CryptoPairsScanner:
             return None
     
     def scan_pairs(self, coins, max_pairs=50, progress_bar=None, max_halflife_hours=720):
-        """Сканировать все пары (v6.0: + stability + FDR + Trade Score)"""
-        results = []
-        all_pvalues = []  # [C] Для FDR-коррекции
-        all_results_indices = []  # Индексы в results для сопоставления с pvalues
+        """Сканировать все пары (v7.0: 2-pass FDR + ADF + Confidence)"""
         
-        # Загружаем данные для всех монет
+        # Загружаем данные
         st.info(f"📥 Загружаю данные для {len(coins)} монет...")
         price_data = {}
         for coin in coins:
@@ -255,133 +254,150 @@ class CryptoPairsScanner:
             prices = self.fetch_ohlcv(symbol)
             if prices is not None and len(prices) > 20:
                 price_data[coin] = prices
-            time.sleep(0.1)  # Rate limit
+            time.sleep(0.1)
         
         if len(price_data) < 2:
             st.error("❌ Недостаточно данных для анализа")
-            st.info(f"""
-            **Возможные причины:**
-            - Биржа {self.exchange_name.upper()} заблокирована в вашем регионе
-            - Проблемы с подключением к интернету
-            - Временные проблемы на бирже
-            
-            **Решения:**
-            1. Выберите другую биржу (Bybit или OKX рекомендуются)
-            2. Проверьте подключение к интернету
-            3. Попробуйте через несколько минут
-            4. Используйте VPN если биржа заблокирована
-            """)
             return []
         
         total_combinations = len(price_data) * (len(price_data) - 1) // 2
-        st.info(f"🔍 Анализирую {total_combinations} комбинаций пар из {len(price_data)} монет...")
+        st.info(f"🔍 Фаза 1: Коинтеграция для {total_combinations} пар из {len(price_data)} монет...")
         processed = 0
         
-        # Тестируем все пары
+        # ═══════ ФАЗА 1: Быстрый тест коинтеграции для ВСЕХ пар ═══════
+        # Собираем ВСЕ p-values (ключевое исправление FDR!)
+        all_pvalues = []
+        candidates = []  # (coin1, coin2, result) для пар с p < 0.10
+        
         for i, coin1 in enumerate(price_data.keys()):
             for coin2 in list(price_data.keys())[i+1:]:
                 processed += 1
-                
                 if progress_bar:
-                    progress_bar.progress(processed / total_combinations, 
-                                        f"Обработано {processed}/{total_combinations}")
+                    progress_bar.progress(
+                        processed / total_combinations * 0.5,  # Фаза 1 = 50%
+                        f"Фаза 1: {processed}/{total_combinations}"
+                    )
                 
                 result = self.test_cointegration(price_data[coin1], price_data[coin2])
                 
-                if result and result['pvalue'] < 0.05:  # Предварительный порог
-                    halflife_hours = result['halflife'] * 24
+                if result:
+                    all_pvalues.append(result['pvalue'])
                     
-                    if halflife_hours <= max_halflife_hours:
-                        # [A] Hurst (DFA)
-                        hurst = calculate_hurst_exponent(result['spread'])
-                        
-                        # OU параметры
-                        dt = {'1h': 1/24, '4h': 1/6, '1d': 1}.get(self.timeframe, 1/6)
-                        ou_params = calculate_ou_parameters(result['spread'], dt=dt)
-                        
-                        # Legacy OU Score
-                        ou_score = calculate_ou_score(ou_params, hurst)
-                        
-                        # Валидация
-                        is_valid, reason = validate_ou_quality(ou_params, hurst)
-                        
-                        # [D] Stability check
-                        stability = check_cointegration_stability(
-                            price_data[coin1].values, price_data[coin2].values
-                        )
-                        
-                        idx = len(results)
-                        results.append({
-                            'pair': f"{coin1}/{coin2}",
-                            'coin1': coin1,
-                            'coin2': coin2,
-                            'pvalue': result['pvalue'],
-                            'pvalue_adj': result['pvalue'],  # Будет обновлено после FDR
-                            'zscore': result['zscore'],
-                            'zscore_series': result.get('zscore_series'),
-                            'hedge_ratio': result['hedge_ratio'],
-                            'intercept': result.get('intercept', 0.0),
-                            'halflife_days': result['halflife'],
-                            'halflife_hours': halflife_hours,
-                            'spread': result['spread'],
-                            'signal': self.get_signal(result['zscore']),
-                            'hurst': hurst,
-                            'theta': ou_params['theta'] if ou_params else 0,
-                            'mu': ou_params['mu'] if ou_params else 0,
-                            'sigma': ou_params['sigma'] if ou_params else 0,
-                            'halflife_ou': ou_params['halflife_ou'] * 24 if ou_params else 999,
-                            'ou_score': ou_score,
-                            'ou_valid': is_valid,
-                            'ou_reason': reason,
-                            # [D] Stability
-                            'stability_score': stability['stability_score'],
-                            'stability_passed': stability['windows_passed'],
-                            'stability_total': stability['total_windows'],
-                            'is_stable': stability['is_stable'],
-                            # Trade Score placeholder
-                            'trade_score': 0,
-                            'trade_breakdown': {},
-                        })
-                        all_pvalues.append(result['pvalue'])
-                        all_results_indices.append(idx)
-        
-        # [C] FDR-коррекция p-values
-        if len(all_pvalues) > 0:
-            # Учитываем ВСЕ протестированные пары для корректного FDR
-            adj_pvalues, fdr_rejected = apply_fdr_correction(all_pvalues, alpha=0.05)
-            
-            fdr_passed = 0
-            fdr_failed = 0
-            for j, idx in enumerate(all_results_indices):
-                results[idx]['pvalue_adj'] = float(adj_pvalues[j])
-                results[idx]['fdr_passed'] = bool(fdr_rejected[j])
-                if fdr_rejected[j]:
-                    fdr_passed += 1
+                    # Сохраняем кандидатов (p < 0.10 для запаса)
+                    halflife_hours = result['halflife'] * 24
+                    if result['pvalue'] < 0.10 and halflife_hours <= max_halflife_hours:
+                        candidates.append((coin1, coin2, result, len(all_pvalues) - 1))
                 else:
-                    fdr_failed += 1
+                    all_pvalues.append(1.0)  # Не удалось — p=1
+        
+        # ═══════ FDR на ВСЕХ p-values ═══════
+        if len(all_pvalues) == 0:
+            return []
+        
+        adj_pvalues, fdr_rejected = apply_fdr_correction(all_pvalues, alpha=0.05)
+        
+        total_fdr_passed = int(np.sum(fdr_rejected))
+        st.info(f"🔬 FDR: {total_fdr_passed} из {len(all_pvalues)} пар прошли (α=0.05)")
+        
+        # ═══════ ФАЗА 2: Дорогие метрики только для кандидатов ═══════
+        st.info(f"🔍 Фаза 2: Детальный анализ {len(candidates)} кандидатов...")
+        results = []
+        dt = {'1h': 1/24, '4h': 1/6, '1d': 1}.get(self.timeframe, 1/6)
+        
+        for idx_c, (coin1, coin2, result, pval_idx) in enumerate(candidates):
+            if progress_bar:
+                progress_bar.progress(
+                    0.5 + (idx_c + 1) / len(candidates) * 0.5,
+                    f"Фаза 2: {idx_c + 1}/{len(candidates)}"
+                )
             
-            st.info(f"🔬 FDR коррекция: {fdr_passed} пар прошли, {fdr_failed} отфильтрованы")
-        
-        # [C] Trade Score (после FDR)
-        for r in results:
-            ou_p = calculate_ou_parameters(r['spread'], 
-                dt={'1h': 1/24, '4h': 1/6, '1d': 1}.get(self.timeframe, 1/6))
-            score, breakdown = calculate_trade_score(
-                hurst=r['hurst'],
-                ou_params=ou_p,
-                pvalue_adj=r['pvalue_adj'],
-                zscore=r['zscore'],
-                stability_score=r['stability_score'],
-                hedge_ratio=r['hedge_ratio']
+            fdr_passed = bool(fdr_rejected[pval_idx])
+            pvalue_adj = float(adj_pvalues[pval_idx])
+            
+            # Hurst (DFA)
+            hurst = calculate_hurst_exponent(result['spread'])
+            hurst_is_fallback = (hurst == 0.5)
+            
+            # OU
+            ou_params = calculate_ou_parameters(result['spread'], dt=dt)
+            ou_score = calculate_ou_score(ou_params, hurst)
+            is_valid, reason = validate_ou_quality(ou_params, hurst)
+            
+            # Stability
+            stability = check_cointegration_stability(
+                price_data[coin1].values, price_data[coin2].values
             )
-            r['trade_score'] = score
-            r['trade_breakdown'] = breakdown
+            
+            # [NEW] ADF-тест спреда
+            adf = adf_test_spread(result['spread'])
+            
+            # [NEW] Trade Score v7
+            score, breakdown = calculate_trade_score(
+                hurst=hurst,
+                ou_params=ou_params,
+                pvalue_adj=pvalue_adj,
+                zscore=result['zscore'],
+                stability_score=stability['stability_score'],
+                hedge_ratio=result['hedge_ratio'],
+                adf_passed=adf['is_stationary'],
+                hurst_is_fallback=hurst_is_fallback
+            )
+            
+            # [NEW] Confidence
+            confidence, conf_checks, conf_total = calculate_confidence(
+                hurst=hurst,
+                stability_score=stability['stability_score'],
+                fdr_passed=fdr_passed,
+                adf_passed=adf['is_stationary'],
+                zscore=result['zscore'],
+                hedge_ratio=result['hedge_ratio'],
+                hurst_is_fallback=hurst_is_fallback
+            )
+            
+            halflife_hours = result['halflife'] * 24
+            
+            results.append({
+                'pair': f"{coin1}/{coin2}",
+                'coin1': coin1,
+                'coin2': coin2,
+                'pvalue': result['pvalue'],
+                'pvalue_adj': pvalue_adj,
+                'fdr_passed': fdr_passed,
+                'zscore': result['zscore'],
+                'zscore_series': result.get('zscore_series'),
+                'hedge_ratio': result['hedge_ratio'],
+                'intercept': result.get('intercept', 0.0),
+                'halflife_days': result['halflife'],
+                'halflife_hours': halflife_hours,
+                'spread': result['spread'],
+                'signal': self.get_signal(result['zscore']),
+                'hurst': hurst,
+                'hurst_is_fallback': hurst_is_fallback,
+                'theta': ou_params['theta'] if ou_params else 0,
+                'mu': ou_params['mu'] if ou_params else 0,
+                'sigma': ou_params['sigma'] if ou_params else 0,
+                'halflife_ou': ou_params['halflife_ou'] * 24 if ou_params else 999,
+                'ou_score': ou_score,
+                'ou_valid': is_valid,
+                'ou_reason': reason,
+                'stability_score': stability['stability_score'],
+                'stability_passed': stability['windows_passed'],
+                'stability_total': stability['total_windows'],
+                'is_stable': stability['is_stable'],
+                'adf_pvalue': adf['adf_pvalue'],
+                'adf_passed': adf['is_stationary'],
+                'trade_score': score,
+                'trade_breakdown': breakdown,
+                'confidence': confidence,
+                'conf_checks': conf_checks,
+                'conf_total': conf_total,
+            })
         
-        # Сортируем по Trade Score (вместо |Z-score|)
+        # Сортируем по Trade Score
         results.sort(key=lambda x: x['trade_score'], reverse=True)
         
         if len(results) > 0:
-            st.success(f"✅ Найдено {len(results)} пар (отфильтровано по half-life < {max_halflife_hours}ч)")
+            st.success(f"✅ Найдено {len(results)} пар (FDR: {total_fdr_passed} подтверждены)")
         
         return results[:max_pairs]
     
@@ -444,22 +460,12 @@ def plot_spread_chart(spread_data, pair_name, zscore):
 # === ИНТЕРФЕЙС ===
 
 st.markdown('<p class="main-header">🔍 Crypto Pairs Trading Scanner</p>', unsafe_allow_html=True)
-st.caption("Версия 2.0.0 | Обновлено: 16 февраля 2026 | DFA + FDR + Stability + Trade Score")
+st.caption("Версия 2.1.0 | 16 февраля 2026 | DFA + ADF + FDR(all) + Stability + Confidence")
 st.markdown("---")
 
 # Sidebar - настройки
 with st.sidebar:
     st.header("⚙️ Настройки")
-    
-    # Индикатор версии
-    st.success("✅ Версия 1.3 активна | Мониторинг позиций")
-    
-    # Информация о гео-блокировках
-    st.info("""
-    ℹ️ **Если Binance заблокирован:**
-    Приложение автоматически переключится на Bybit.
-    Или выберите другую биржу вручную.
-    """)
     
     exchange = st.selectbox(
         "Биржа",
@@ -762,14 +768,16 @@ if st.session_state.pairs_data is not None:
     if len(pairs) > 0:
         df_display = pd.DataFrame([{
             'Пара': p['pair'],
-            'Trade Score': p.get('trade_score', 0),
+            'Score': p.get('trade_score', 0),
+            'Conf': p.get('confidence', '?'),
             'Z-Score': round(p['zscore'], 2),
-            'P-value': round(p.get('pvalue_adj', p['pvalue']), 4),
+            'P-adj': round(p.get('pvalue_adj', p['pvalue']), 4),
             'FDR': '✅' if p.get('fdr_passed', False) else '❌',
+            'ADF': '✅' if p.get('adf_passed', False) else '❌',
             'Hurst': round(p.get('hurst', 0.5), 3),
-            'θ (Theta)': round(p.get('theta', 0), 3),
+            'θ': round(p.get('theta', 0), 3),
             'Stab': f"{p.get('stability_passed', 0)}/{p.get('stability_total', 4)}",
-            'Half-life': (
+            'HL': (
                 f"{p.get('halflife_hours', p['halflife_days']*24):.1f}ч" 
                 if p.get('halflife_hours', p['halflife_days']*24) < 48 
                 else (
@@ -778,14 +786,14 @@ if st.session_state.pairs_data is not None:
                     else '∞'
                 )
             ),
-            'Hedge Ratio': round(p['hedge_ratio'], 4),
+            'HR': round(p['hedge_ratio'], 4),
             'Сигнал': p['signal']
         } for p in pairs])
     else:
         # Пустая таблица если нет пар
         df_display = pd.DataFrame(columns=[
-            'Пара', 'Trade Score', 'Z-Score', 'P-value', 'FDR', 'Hurst', 
-            'θ (Theta)', 'Stab', 'Half-life', 'Hedge Ratio', 'Сигнал'
+            'Пара', 'Score', 'Conf', 'Z-Score', 'P-adj', 'FDR', 'ADF',
+            'Hurst', 'θ', 'Stab', 'HL', 'HR', 'Сигнал'
         ])
     
     # Функция для выбора строки
@@ -807,82 +815,90 @@ if st.session_state.pairs_data is not None:
     selected_rows = dataframe_with_selections(df_display)
     
     if len(selected_rows) > 0:
-        # Автоматически открываем детальный анализ для выбранной пары
         st.session_state.selected_pair_index = selected_rows[0]
-        
-    
     
     # Детальный анализ выбранной пары
     if len(pairs) > 0:
         st.markdown("---")
         st.subheader("📈 Детальный анализ пары")
         
-        # Создаем список пар для выбора
         pair_options = [p['pair'] for p in pairs]
         
-        # Сбрасываем индекс если он выходит за пределы
+        # Ограничиваем индекс
         if st.session_state.selected_pair_index >= len(pair_options):
             st.session_state.selected_pair_index = 0
         
+        # Selectbox с index из session_state (обновляется по checkbox)
         selected_pair = st.selectbox(
             "Выберите пару для анализа:",
             pair_options,
             index=st.session_state.selected_pair_index,
-            key=f'pair_selector_{len(pairs)}'  # Уникальный ключ при изменении данных
+            key='pair_selector_main'
         )
         
-        # Обновляем индекс
+        # Синхронизируем обратно
         st.session_state.selected_pair_index = pair_options.index(selected_pair)
         
         selected_data = next(p for p in pairs if p['pair'] == selected_pair)
     
-    # Заголовок с текущей парой
-    st.markdown(f"### 🎯 Анализ: **{selected_pair}**")
+    # Заголовок с Confidence
+    conf = selected_data.get('confidence', '?')
+    conf_emoji = '🟢' if conf == 'HIGH' else '🟡' if conf == 'MEDIUM' else '🔴'
+    st.markdown(f"### {conf_emoji} {conf} | Анализ: **{selected_pair}**")
     
-    # Информация о паре
-    col1, col2, col3, col4 = st.columns(4)
+    # ⚠️ Предупреждения об edge cases
+    warnings_list = []
+    if selected_data.get('hurst_is_fallback', False) or selected_data.get('hurst', 0.5) == 0.5:
+        warnings_list.append("⚠️ Hurst = 0.5 (DFA не дал надёжный результат)")
+    if abs(selected_data['zscore']) > 5:
+        warnings_list.append(f"⚠️ |Z| = {abs(selected_data['zscore']):.1f} > 5 — аномальное отклонение, возможно сломанная модель")
+    if selected_data['hedge_ratio'] < 0:
+        warnings_list.append(f"⚠️ Hedge Ratio = {selected_data['hedge_ratio']:.4f} < 0 — не арбитраж (обе ноги в одну сторону)")
+    if not selected_data.get('fdr_passed', False):
+        warnings_list.append("⚠️ Не прошла FDR-коррекцию — коинтеграция ненадёжна")
+    if not selected_data.get('adf_passed', False):
+        warnings_list.append("⚠️ ADF-тест: спред не стационарен")
+    
+    if warnings_list:
+        st.warning("\n".join(warnings_list))
+    
+    # Основные метрики
+    col1, col2, col3, col4, col5 = st.columns(5)
     
     with col1:
         st.metric("Z-Score", f"{selected_data['zscore']:.2f}")
-    
     with col2:
         signal_color = "🟢" if selected_data['signal'] == 'LONG' else "🔴" if selected_data['signal'] == 'SHORT' else "⚪"
         st.metric("Сигнал", f"{signal_color} {selected_data['signal']}")
-    
     with col3:
-        st.metric("P-value", f"{selected_data['pvalue']:.4f}")
-    
+        st.metric("P-adj", f"{selected_data.get('pvalue_adj', selected_data['pvalue']):.4f}")
     with col4:
-        hl = selected_data['halflife_days']
-        hl_hours = selected_data.get('halflife_hours', hl * 24)
-        if hl_hours < 48:  # Если меньше 2 дней, показываем в часах
-            st.metric("Half-life", f"{hl_hours:.1f} ч")
-        else:
-            st.metric("Half-life", f"{hl:.1f} д ({hl_hours:.0f}ч)" if hl != np.inf else "∞")
+        hl_hours = selected_data.get('halflife_hours', selected_data['halflife_days'] * 24)
+        st.metric("Half-life", f"{hl_hours:.1f}ч" if hl_hours < 48 else "∞")
+    with col5:
+        conf_checks = selected_data.get('conf_checks', 0)
+        conf_total = selected_data.get('conf_total', 6)
+        st.metric("Confidence", f"{conf} ({conf_checks}/{conf_total})")
     
-    # Mean Reversion Analysis (v6.0)
+    # Mean Reversion Analysis v7.0
     if 'hurst' in selected_data and 'theta' in selected_data:
         st.markdown("---")
-        st.subheader("🔬 Mean Reversion Analysis (v6.0)")
+        st.subheader("🔬 Mean Reversion Analysis (v7.0)")
         
-        # Trade Score — главный показатель
+        # Trade Score
         trade_score = selected_data.get('trade_score', 0)
         trade_bd = selected_data.get('trade_breakdown', {})
         
         ts_col1, ts_col2 = st.columns([1, 3])
         with ts_col1:
             if trade_score >= 70:
-                ts_emoji = "🟢"
-                ts_status = "Отличный"
+                ts_emoji, ts_status = "🟢", "Отличный"
             elif trade_score >= 50:
-                ts_emoji = "🟡"
-                ts_status = "Хороший"
+                ts_emoji, ts_status = "🟡", "Хороший"
             elif trade_score >= 30:
-                ts_emoji = "🟠"
-                ts_status = "Слабый"
+                ts_emoji, ts_status = "🟠", "Слабый"
             else:
-                ts_emoji = "🔴"
-                ts_status = "Не входить"
+                ts_emoji, ts_status = "🔴", "Не входить"
             st.metric(f"{ts_emoji} Trade Score", f"{trade_score}/100", ts_status)
         
         with ts_col2:
@@ -890,18 +906,20 @@ if st.session_state.pairs_data is not None:
                 bd_text = " | ".join([f"**{k}**: {v}" for k, v in trade_bd.items()])
                 st.caption(f"Разбивка: {bd_text}")
                 
-                # FDR статус
-                fdr_status = "✅ FDR passed" if selected_data.get('fdr_passed', False) else "❌ FDR failed"
+                fdr_s = "✅ FDR" if selected_data.get('fdr_passed', False) else "❌ FDR"
+                adf_s = "✅ ADF" if selected_data.get('adf_passed', False) else "❌ ADF"
                 stab = selected_data.get('stability_passed', 0)
-                stab_total = selected_data.get('stability_total', 4)
-                stab_status = f"{'✅' if selected_data.get('is_stable', False) else '⚠️'} Стабильность: {stab}/{stab_total} окон"
-                st.caption(f"{fdr_status} | {stab_status} | P-adj: {selected_data.get('pvalue_adj', 0):.4f}")
+                stab_t = selected_data.get('stability_total', 4)
+                stab_s = f"{'✅' if selected_data.get('is_stable', False) else '⚠️'} Stab:{stab}/{stab_t}"
+                st.caption(f"{fdr_s} | {adf_s} | {stab_s} | P-adj: {selected_data.get('pvalue_adj', 0):.4f}")
         
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
             hurst = selected_data['hurst']
-            if hurst < 0.35:
+            if selected_data.get('hurst_is_fallback', False):
+                hurst_status = "⚠️ Fallback"
+            elif hurst < 0.35:
                 hurst_status = "🟢 Strong MR"
             elif hurst < 0.48:
                 hurst_status = "🟢 Reverting"
@@ -917,18 +935,22 @@ if st.session_state.pairs_data is not None:
             st.metric("θ (Скорость)", f"{theta:.3f}", theta_status)
         
         with col3:
-            st.metric("Hedge Ratio", f"{selected_data['hedge_ratio']:.4f}",
-                      "✅ OK" if 0.2 <= abs(selected_data['hedge_ratio']) <= 5.0 else "⚠️ Экстрем.")
+            hr = selected_data['hedge_ratio']
+            if hr < 0:
+                hr_status = "❌ Отрицат."
+            elif 0.2 <= abs(hr) <= 5.0:
+                hr_status = "✅ OK"
+            else:
+                hr_status = "⚠️ Экстрем."
+            st.metric("Hedge Ratio", f"{hr:.4f}", hr_status)
         
         with col4:
             if theta > 0:
                 exit_time = estimate_exit_time(
                     current_z=selected_data['zscore'],
-                    theta=theta,
-                    target_z=0.5
+                    theta=theta, target_z=0.5
                 )
-                exit_hours = exit_time * 24
-                st.metric("Прогноз выхода", f"{exit_hours:.1f}ч", "до Z=0.5")
+                st.metric("Прогноз выхода", f"{exit_time * 24:.1f}ч", "до Z=0.5")
             else:
                 st.metric("Прогноз выхода", "∞", "Нет возврата")
         
@@ -936,47 +958,45 @@ if st.session_state.pairs_data is not None:
         info_col1, info_col2 = st.columns(2)
         
         with info_col1:
-            if hurst < 0.35:
+            if selected_data.get('hurst_is_fallback', False):
+                hurst_msg = "⚠️ **DFA не смог определить** (Hurst = 0.5)"
+                hurst_desc = "Недостаточно данных или плохой фит. Решение должно основываться на других метриках."
+            elif hurst < 0.35:
                 hurst_msg = "🟢 **Сильный mean-reversion** (H < 0.35)"
-                hurst_desc = "Идеальная пара для арбитража! DFA подтверждает устойчивый возврат к среднему."
+                hurst_desc = "DFA подтверждает устойчивый возврат к среднему."
             elif hurst < 0.48:
                 hurst_msg = "🟢 **Mean-reverting** (H < 0.48)"
-                hurst_desc = "Хорошая пара. DFA показывает возврат к среднему."
+                hurst_desc = "DFA показывает возврат к среднему."
             elif hurst < 0.52:
                 hurst_msg = "⚪ **Random walk** (H ≈ 0.5)"
-                hurst_desc = "Случайное блуждание. Нет статистического основания для торговли."
+                hurst_desc = "Нет основания для mean-reversion торговли."
             else:
                 hurst_msg = "🔴 **Trending** (H > 0.52)"
-                hurst_desc = "НЕ подходит для парного арбитража! Спред трендовый."
+                hurst_desc = "НЕ подходит для парного арбитража!"
             
             st.info(f"""
             **Hurst (DFA):** {hurst_msg}
             
             {hurst_desc}
-            
-            **Шкала DFA (валидировано на синтетике):**
-            • H < 0.35 → Strong mean-reversion ✅
-            • H < 0.48 → Mean-reverting ✅
-            • H ≈ 0.50 → Random walk ⚪
-            • H > 0.55 → Trending ❌
             """)
         
         with info_col2:
             if theta > 2.0:
-                theta_msg = "🟢 **Очень быстрый возврат** (~{:.1f}ч)".format(-np.log(0.5)/theta * 24)
+                theta_msg = "🟢 **Очень быстрый** (~{:.1f}ч)".format(-np.log(0.5)/theta * 24)
             elif theta > 1.0:
-                theta_msg = "🟢 **Быстрый возврат** (~{:.1f}ч)".format(-np.log(0.5)/theta * 24)
+                theta_msg = "🟢 **Быстрый** (~{:.1f}ч)".format(-np.log(0.5)/theta * 24)
             elif theta > 0.5:
-                theta_msg = "🟡 **Средний возврат** (~{:.1f}ч)".format(-np.log(0.5)/theta * 24)
+                theta_msg = "🟡 **Средний** (~{:.1f}ч)".format(-np.log(0.5)/theta * 24)
             else:
                 theta_msg = "🔴 **Медленный** (>{:.0f}ч)".format(-np.log(0.5)/theta * 24 if theta > 0 else 999)
             
-            st.info(f"""
-            **OU Process (θ):**
-            {theta_msg}
+            adf_p = selected_data.get('adf_pvalue', 1.0)
+            adf_ok = selected_data.get('adf_passed', False)
             
-            Скорость возврата к среднему.
-            Чем выше θ, тем быстрее возврат.
+            st.info(f"""
+            **OU Process (θ):** {theta_msg}
+            
+            **ADF-тест:** p={adf_p:.4f} {'✅ Стационарен' if adf_ok else '❌ Нестационарен'}
             """)
     
     # График спреда
@@ -1205,6 +1225,6 @@ else:
 # Footer
 st.markdown("---")
 st.caption("⚠️ Disclaimer: Этот инструмент предназначен только для образовательных целей. Не является финансовой рекомендацией.")
-# VERSION: 2.0
+# VERSION: 2.1
 # LAST UPDATED: 2026-02-16
-# FEATURES: DFA Hurst, FDR correction, rolling Z-score, cointegration stability, Trade Score, position monitoring
+# FEATURES: DFA Hurst, ADF spread test, FDR on ALL pairs, cointegration stability, Trade Score v7, Confidence, edge case handling
