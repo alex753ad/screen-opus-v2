@@ -1,18 +1,15 @@
 """
 Модуль расчета Hurst Exponent и Ornstein-Uhlenbeck параметров
-ВЕРСИЯ v7.0.0: ADF + Fixed FDR + Edge Cases + Confidence
+ВЕРСИЯ v8.0.0: Quality/Signal Score + Adaptive Thresholds + HR Cutoff
 
 Дата: 16 февраля 2026
 
-ИЗМЕНЕНИЯ v7.0.0:
-  [A] Hurst через DFA на инкрементах (из v6.0)
-  [B] Rolling Z-score без lookahead bias (из v6.0)
-  [C] FDR — теперь принимает ВСЕ p-values (ИСПРАВЛЕНО)
-  [D] Rolling cointegration stability (из v6.0)
-  [NEW] ADF-тест спреда — независимое подтверждение стационарности
-  [NEW] Edge cases: Hurst=0.5 fallback → 0 pts, |Z|>5 → cap, HR<0 → 0 pts
-  [NEW] Перевзвешивание: Stability 10→20, Z-score 25→20
-  [NEW] Confidence level (LOW/MEDIUM/HIGH)
+ИЗМЕНЕНИЯ v8.0.0:
+  [D-A] Adaptive Z-threshold по Confidence (HIGH→1.5, MEDIUM→2.0)
+  [D-A] Сигналы: SIGNAL/READY/WATCH/NEUTRAL
+  [D-B] Раздельные Quality Score и Signal Score
+  [D-A] HR > 100 → жёсткий cutoff
+  Всё из v7: DFA, ADF, FDR, Stability, Confidence, edge cases
 """
 
 import numpy as np
@@ -20,14 +17,11 @@ from scipy import stats
 
 
 # =============================================================================
-# [A] HURST EXPONENT — DFA
+# HURST — DFA
 # =============================================================================
 
 def calculate_hurst_exponent(time_series, min_window=4):
-    """
-    DFA на инкрементах. H < 0.5 mean-reverting, ≈ 0.5 random walk, > 0.5 trending.
-    Возвращает 0.5 как fallback при недостатке данных или плохом фите (R² < 0.70).
-    """
+    """DFA на инкрементах. Возвращает 0.5 при fallback."""
     ts = np.array(time_series, dtype=float)
     n = len(ts)
     if n < 30:
@@ -62,8 +56,7 @@ def calculate_hurst_exponent(time_series, min_window=4):
             segment = profile[seg * w:(seg + 1) * w]
             x = np.arange(w, dtype=float)
             coeffs = np.polyfit(x, segment, 1)
-            trend = np.polyval(coeffs, x)
-            f2_sum += np.mean((segment - trend) ** 2)
+            f2_sum += np.mean((segment - np.polyval(coeffs, x)) ** 2)
             count += 1
         for seg in range(n_seg):
             start = n_inc - (seg + 1) * w
@@ -72,8 +65,7 @@ def calculate_hurst_exponent(time_series, min_window=4):
             segment = profile[start:start + w]
             x = np.arange(w, dtype=float)
             coeffs = np.polyfit(x, segment, 1)
-            trend = np.polyval(coeffs, x)
-            f2_sum += np.mean((segment - trend) ** 2)
+            f2_sum += np.mean((segment - np.polyval(coeffs, x)) ** 2)
             count += 1
         if count > 0:
             f_n = np.sqrt(f2_sum / count)
@@ -96,7 +88,7 @@ def calculate_hurst_exponent(time_series, min_window=4):
 
 
 # =============================================================================
-# [B] ROLLING Z-SCORE
+# ROLLING Z-SCORE
 # =============================================================================
 
 def calculate_rolling_zscore(spread, window=30):
@@ -157,28 +149,19 @@ def calculate_ou_parameters(spread, dt=1.0):
 
 
 # =============================================================================
-# [NEW] ADF-ТЕСТ СПРЕДА
+# ADF-ТЕСТ СПРЕДА
 # =============================================================================
 
 def adf_test_spread(spread, significance=0.05):
-    """
-    Augmented Dickey-Fuller тест на стационарность спреда.
-    Независимое подтверждение: если спред стационарен → mean-reverting.
-
-    Returns:
-        dict: adf_stat, adf_pvalue, is_stationary, critical_values
-    """
+    """ADF тест на стационарность спреда."""
     from statsmodels.tsa.stattools import adfuller
-
     try:
         spread = np.array(spread, dtype=float)
         if len(spread) < 20:
             return {'adf_stat': 0, 'adf_pvalue': 1.0, 'is_stationary': False, 'critical_values': {}}
-
         result = adfuller(spread, autolag='AIC')
         return {
-            'adf_stat': float(result[0]),
-            'adf_pvalue': float(result[1]),
+            'adf_stat': float(result[0]), 'adf_pvalue': float(result[1]),
             'is_stationary': result[1] < significance,
             'critical_values': {k: float(v) for k, v in result[4].items()}
         }
@@ -187,22 +170,11 @@ def adf_test_spread(spread, significance=0.05):
 
 
 # =============================================================================
-# [C] FDR-КОРРЕКЦИЯ (ИСПРАВЛЕННАЯ v7.0)
+# FDR-КОРРЕКЦИЯ
 # =============================================================================
 
 def apply_fdr_correction(pvalues, alpha=0.05):
-    """
-    Benjamini-Hochberg FDR.
-
-    ВАЖНО v7.0: Передавайте ВСЕ p-values (включая > 0.05)!
-    Тогда BH корректно учитывает полное число тестов.
-
-    Args:
-        pvalues: список ВСЕХ p-values от коинтеграционных тестов
-        alpha: целевой FDR
-    Returns:
-        (adjusted_pvalues, rejected): массивы той же длины
-    """
+    """Benjamini-Hochberg FDR. Передавайте ВСЕ p-values!"""
     pvalues = np.array(pvalues, dtype=float)
     n = len(pvalues)
     if n == 0:
@@ -214,36 +186,30 @@ def apply_fdr_correction(pvalues, alpha=0.05):
     adjusted = np.empty(n)
     for i in range(n):
         adjusted[i] = sorted_p[i] * n / (i + 1)
-
     for i in range(n - 2, -1, -1):
         adjusted[i] = min(adjusted[i], adjusted[i + 1])
-
     adjusted = np.minimum(adjusted, 1.0)
 
     result = np.empty(n)
     result[sorted_idx] = adjusted
-
     return result, result <= alpha
 
 
 # =============================================================================
-# [D] ROLLING COINTEGRATION STABILITY
+# COINTEGRATION STABILITY
 # =============================================================================
 
 def check_cointegration_stability(series1, series2, window_fraction=0.6):
-    """Проверка на 4 подокнах: полное, начало, конец, середина."""
+    """4 подокна: полное, начало, конец, середина."""
     from statsmodels.tsa.stattools import coint
-
     s1, s2 = np.array(series1, dtype=float), np.array(series2, dtype=float)
     n = min(len(s1), len(s2))
     if n < 30:
         return {'is_stable': False, 'windows_passed': 0, 'total_windows': 0,
                 'stability_score': 0.0, 'pvalues': []}
-
     ws = max(20, int(n * window_fraction))
     mid = (n - ws) // 2
     windows = [(0, n), (0, ws), (n - ws, n), (mid, mid + ws)]
-
     pvalues, passed = [], 0
     for start, end in windows:
         end = min(end, n)
@@ -256,11 +222,9 @@ def check_cointegration_stability(series1, series2, window_fraction=0.6):
                 passed += 1
         except Exception:
             pvalues.append(1.0)
-
     total = len(pvalues)
     return {
-        'is_stable': passed >= 3,
-        'windows_passed': passed,
+        'is_stable': passed >= 3, 'windows_passed': passed,
         'total_windows': total,
         'stability_score': round(passed / total if total > 0 else 0.0, 3),
         'pvalues': pvalues
@@ -268,161 +232,225 @@ def check_cointegration_stability(series1, series2, window_fraction=0.6):
 
 
 # =============================================================================
-# [NEW] КОМПОЗИТНЫЙ TRADE SCORE v7 (перевзвешен + edge cases)
+# CONFIDENCE
 # =============================================================================
 
-def calculate_trade_score(hurst, ou_params, pvalue_adj, zscore,
-                          stability_score, hedge_ratio,
-                          adf_passed=None, hurst_is_fallback=False):
+def calculate_confidence(hurst, stability_score, fdr_passed, adf_passed,
+                         zscore, hedge_ratio, hurst_is_fallback=False):
+    """HIGH / MEDIUM / LOW на основе 6 критериев."""
+    checks = 0
+    if fdr_passed:
+        checks += 1
+    if adf_passed:
+        checks += 1
+    if not hurst_is_fallback and hurst != 0.5 and hurst < 0.48:
+        checks += 1
+    if stability_score >= 0.75:
+        checks += 1
+    if 0 < hedge_ratio and 0.1 <= abs(hedge_ratio) <= 10.0:
+        checks += 1
+    if 1.5 <= abs(zscore) <= 5.0:
+        checks += 1
+
+    if checks >= 5:
+        return "HIGH", checks, 6
+    elif checks >= 3:
+        return "MEDIUM", checks, 6
+    else:
+        return "LOW", checks, 6
+
+
+# =============================================================================
+# [D-B] QUALITY SCORE — насколько пара надёжна
+# =============================================================================
+
+def calculate_quality_score(hurst, ou_params, pvalue_adj, stability_score,
+                            hedge_ratio, adf_passed=None,
+                            hurst_is_fallback=False):
     """
-    Trade Score v7 (0-100).
+    Quality Score (0-100) — оценка ПАРЫ, без привязки к текущему Z.
 
-    ИЗМЕНЕНИЯ v7:
-      - Stability: 10 → 20 (ключевой предиктор)
-      - Z-score: 25 → 15 (триггер, но не главное)
-      - ADF: новый компонент (10)
-      - |Z| > 5 → аномалия, cap at 5 pts
-      - Hurst = 0.5 fallback → 0 pts
-      - HR < 0 → 0 pts (не арбитраж)
+    Это "стационарная" метрика: если пара качественная, она будет
+    качественной и завтра. Используется для Watchlist.
 
-    Веса:
-      P-value (FDR):   20
-      Hurst (DFA):     15
-      Stability:       20
-      Z-score:         15
-      OU half-life:    10
-      ADF:             10
-      Hedge ratio:     10
-                      ----
-                      100
+    Компоненты:
+      FDR p-value:    25  — статистическая надёжность коинтеграции
+      Stability:      25  — устойчивость во времени
+      Hurst (DFA):    20  — подтверждение mean-reversion
+      ADF:            15  — независимый тест стационарности
+      Hedge ratio:    15  — практичность для торговли
+                     ----
+                     100
     """
     bd = {}
 
-    # --- P-value после FDR (20) ---
-    bd['pvalue'] = 20 if pvalue_adj <= 0.01 else 15 if pvalue_adj <= 0.03 else 10 if pvalue_adj <= 0.05 else 0
+    # FDR (25)
+    bd['fdr'] = 25 if pvalue_adj <= 0.01 else 20 if pvalue_adj <= 0.03 else 12 if pvalue_adj <= 0.05 else 0
 
-    # --- Hurst (15) --- EDGE CASE: fallback=0.5 → 0 pts
+    # Stability (25)
+    bd['stability'] = int(stability_score * 25)
+
+    # Hurst (20)
     if hurst_is_fallback or hurst == 0.5:
-        bd['hurst'] = 0  # Не знаем → не даём баллы
+        bd['hurst'] = 0
     elif hurst <= 0.30:
-        bd['hurst'] = 15
+        bd['hurst'] = 20
     elif hurst <= 0.40:
-        bd['hurst'] = 12
+        bd['hurst'] = 15
     elif hurst <= 0.48:
-        bd['hurst'] = 8
+        bd['hurst'] = 10
     elif hurst < 0.50:
         bd['hurst'] = 4
     else:
-        bd['hurst'] = 0  # trending
+        bd['hurst'] = 0
 
-    # --- Stability (20) ---
-    bd['stability'] = int(stability_score * 20)
+    # ADF (15)
+    bd['adf'] = 15 if adf_passed else 0
 
-    # --- Z-score (15) --- EDGE CASE: |Z|>5 → аномалия
-    az = abs(zscore)
-    if az > 5.0:
-        bd['zscore'] = 5  # Аномалия: может быть сломанная модель
-    elif az >= 2.5:
-        bd['zscore'] = 15
-    elif az >= 2.0:
-        bd['zscore'] = 12
-    elif az >= 1.5:
-        bd['zscore'] = 6
-    elif az >= 1.0:
-        bd['zscore'] = 3
+    # Hedge ratio (15)
+    if hedge_ratio <= 0 or abs(hedge_ratio) > 100:
+        bd['hedge_ratio'] = 0
+    elif 0.2 <= abs(hedge_ratio) <= 5.0:
+        bd['hedge_ratio'] = 15
+    elif 0.1 <= abs(hedge_ratio) <= 10.0:
+        bd['hedge_ratio'] = 10
+    elif 0.05 <= abs(hedge_ratio) <= 20.0:
+        bd['hedge_ratio'] = 5
     else:
-        bd['zscore'] = 0
-
-    # --- OU half-life (10) ---
-    if ou_params is not None:
-        hl = ou_params['halflife_ou'] * 24
-        bd['halflife'] = 10 if 4 <= hl <= 24 else 7 if hl <= 48 else 5 if 2 <= hl < 4 else 2 if hl < 2 else 0
-    else:
-        bd['halflife'] = 0
-
-    # --- ADF (10) ---
-    if adf_passed is True:
-        bd['adf'] = 10
-    elif adf_passed is False:
-        bd['adf'] = 0
-    else:
-        bd['adf'] = 0  # Не проводился
-
-    # --- Hedge ratio (10) --- EDGE CASE: HR < 0 → 0
-    if hedge_ratio < 0:
-        bd['hedge_ratio'] = 0  # Не арбитраж — обе ноги в одну сторону
-    else:
-        ahr = abs(hedge_ratio)
-        bd['hedge_ratio'] = 10 if 0.2 <= ahr <= 5.0 else 7 if 0.1 <= ahr <= 10.0 else 4 if 0.05 <= ahr <= 20.0 else 1
+        bd['hedge_ratio'] = 2
 
     total = max(0, min(100, sum(bd.values())))
     return int(total), bd
 
 
 # =============================================================================
-# [NEW] CONFIDENCE LEVEL
+# [D-B] SIGNAL SCORE — насколько сейчас хороший момент для входа
 # =============================================================================
 
-def calculate_confidence(hurst, stability_score, fdr_passed, adf_passed,
-                         zscore, hedge_ratio, hurst_is_fallback=False):
+def calculate_signal_score(zscore, ou_params, confidence):
     """
-    Confidence: LOW / MEDIUM / HIGH.
+    Signal Score (0-100) — оценка МОМЕНТА входа.
 
-    Основан на согласованности метрик, а не на абсолютных значениях.
-    Трейдеру нужно быстро видеть: можно ли доверять этому сигналу?
+    Меняется каждый скан. Высокий Signal = пора входить.
 
-    HIGH (все подтверждают):
-      - FDR passed
-      - ADF passed
-      - Hurst < 0.48 (и не fallback)
-      - Stability >= 3/4
-      - HR > 0 и в разумном диапазоне
-      - |Z| в диапазоне 2-5
-
-    MEDIUM (частичное подтверждение):
-      - Хотя бы 3 из 6 критериев
-
-    LOW (мало подтверждений):
-      - Менее 3 критериев
+    Компоненты:
+      Z-score сила:       40  — главный триггер
+      Скорость возврата:  30  — theta / OU half-life
+      Confidence бонус:   30  — HIGH усиливает сигнал
+                         ----
+                         100
     """
-    checks = 0
-    total_checks = 6
+    bd = {}
 
-    # 1. FDR
-    if fdr_passed:
-        checks += 1
-
-    # 2. ADF
-    if adf_passed:
-        checks += 1
-
-    # 3. Hurst
-    if not hurst_is_fallback and hurst != 0.5 and hurst < 0.48:
-        checks += 1
-
-    # 4. Stability
-    if stability_score >= 0.75:  # 3/4 или 4/4
-        checks += 1
-
-    # 5. Hedge ratio
-    if hedge_ratio > 0 and 0.1 <= abs(hedge_ratio) <= 10.0:
-        checks += 1
-
-    # 6. Z-score в нормальном диапазоне
-    if 1.5 <= abs(zscore) <= 5.0:
-        checks += 1
-
-    if checks >= 5:
-        return "HIGH", checks, total_checks
-    elif checks >= 3:
-        return "MEDIUM", checks, total_checks
+    # Z-score (40)
+    az = abs(zscore)
+    if az > 5.0:
+        bd['zscore'] = 10  # Аномалия — не доверяем
+    elif az >= 3.0:
+        bd['zscore'] = 40
+    elif az >= 2.5:
+        bd['zscore'] = 35
+    elif az >= 2.0:
+        bd['zscore'] = 30
+    elif az >= 1.5:
+        bd['zscore'] = 20
+    elif az >= 1.0:
+        bd['zscore'] = 10
     else:
-        return "LOW", checks, total_checks
+        bd['zscore'] = 0
+
+    # OU speed (30)
+    if ou_params is not None:
+        hl = ou_params['halflife_ou'] * 24  # часы
+        if hl <= 12:
+            bd['ou_speed'] = 30
+        elif hl <= 20:
+            bd['ou_speed'] = 25
+        elif hl <= 28:
+            bd['ou_speed'] = 15
+        elif hl <= 48:
+            bd['ou_speed'] = 8
+        else:
+            bd['ou_speed'] = 0
+    else:
+        bd['ou_speed'] = 0
+
+    # Confidence бонус (30)
+    if confidence == "HIGH":
+        bd['confidence'] = 30
+    elif confidence == "MEDIUM":
+        bd['confidence'] = 15
+    else:
+        bd['confidence'] = 0
+
+    total = max(0, min(100, sum(bd.values())))
+    return int(total), bd
 
 
 # =============================================================================
-# LEGACY
+# [D-A] ADAPTIVE SIGNAL — определение торгового состояния
 # =============================================================================
+
+def get_adaptive_signal(zscore, confidence, quality_score):
+    """
+    Адаптивный торговый сигнал на основе Z-score, Confidence и Quality.
+
+    Состояния:
+      SIGNAL  — входить сейчас (сильное отклонение у качественной пары)
+      READY   — почти готово к входу (можно входить агрессивно)
+      WATCH   — мониторить, приближается к порогу
+      NEUTRAL — далеко от входа
+
+    Пороги:
+      HIGH confidence + Quality >= 50:   SIGNAL при |Z|≥1.5, READY при |Z|≥1.2
+      MEDIUM confidence + Quality >= 40: SIGNAL при |Z|≥2.0, READY при |Z|≥1.5
+      LOW / low quality:                 SIGNAL при |Z|≥2.5, READY при |Z|≥2.0
+
+    Returns:
+        (state, direction, threshold_used)
+        state: SIGNAL/READY/WATCH/NEUTRAL
+        direction: LONG/SHORT/NONE
+        threshold_used: фактический порог для этой пары
+    """
+    az = abs(zscore)
+    direction = "LONG" if zscore < 0 else "SHORT" if zscore > 0 else "NONE"
+
+    # Аномалия
+    if az > 5.0:
+        return "NEUTRAL", "NONE", 5.0
+
+    # Определяем пороги
+    if confidence == "HIGH" and quality_score >= 50:
+        t_signal, t_ready, t_watch = 1.5, 1.2, 0.8
+    elif confidence == "MEDIUM" and quality_score >= 40:
+        t_signal, t_ready, t_watch = 2.0, 1.5, 1.0
+    else:
+        t_signal, t_ready, t_watch = 2.5, 2.0, 1.5
+
+    if az >= t_signal:
+        return "SIGNAL", direction, t_signal
+    elif az >= t_ready:
+        return "READY", direction, t_signal
+    elif az >= t_watch:
+        return "WATCH", direction, t_signal
+    else:
+        return "NEUTRAL", "NONE", t_signal
+
+
+# =============================================================================
+# LEGACY COMPATIBILITY
+# =============================================================================
+
+def calculate_trade_score(hurst, ou_params, pvalue_adj, zscore,
+                          stability_score, hedge_ratio,
+                          adf_passed=None, hurst_is_fallback=False):
+    """Legacy — вызывает quality + signal и объединяет."""
+    q, qbd = calculate_quality_score(hurst, ou_params, pvalue_adj,
+                                      stability_score, hedge_ratio,
+                                      adf_passed, hurst_is_fallback)
+    # Простое среднее для обратной совместимости
+    return q, qbd
+
 
 def calculate_ou_score(ou_params, hurst):
     """Legacy OU Score."""
@@ -474,61 +502,43 @@ def validate_ou_quality(ou_params, hurst=None, min_theta=0.1, max_halflife=100):
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  v7.0.0 — ADF + Fixed FDR + Edge Cases + Confidence")
+    print("  v8.0.0 — Quality/Signal Score + Adaptive Thresholds")
     print("=" * 60)
-
     np.random.seed(42)
 
     # DFA
-    print("\n--- DFA Hurst ---")
     spread_mr = [0.0]
     for i in range(250):
         dx = 0.8 * (0 - spread_mr[-1]) + 0.5 * np.random.randn()
         spread_mr.append(spread_mr[-1] + dx)
-    h_mr = calculate_hurst_exponent(spread_mr)
-    print(f"Mean-reverting: H={h_mr:.4f}")
-    print(f"Random walk:    H={calculate_hurst_exponent(list(np.cumsum(np.random.randn(250)))):.4f}")
+    h = calculate_hurst_exponent(spread_mr)
+    print(f"\nDFA MR: H={h:.4f}")
 
-    # ADF
-    print("\n--- ADF Test ---")
-    adf = adf_test_spread(spread_mr)
-    print(f"MR spread: stat={adf['adf_stat']:.3f}, p={adf['adf_pvalue']:.4f}, stationary={adf['is_stationary']}")
-    rw = np.cumsum(np.random.randn(250))
-    adf_rw = adf_test_spread(rw)
-    print(f"RW spread: stat={adf_rw['adf_stat']:.3f}, p={adf_rw['adf_pvalue']:.4f}, stationary={adf_rw['is_stationary']}")
-
-    # FDR — передаём ВСЕ p-values (имитация: 7 значимых + 93 нет)
-    print("\n--- FDR (all p-values, N=100) ---")
-    pvals = [0.001, 0.005, 0.01, 0.02, 0.03, 0.04, 0.049] + [0.5 + 0.005*i for i in range(93)]
-    adj, rej = apply_fdr_correction(pvals, alpha=0.05)
-    for p, a, r in list(zip(pvals[:7], adj[:7], rej[:7])):
-        print(f"  p={p:.3f} → adj={a:.4f} {'✅' if r else '❌'}")
-
-    # Trade Score edge cases
-    print("\n--- Trade Score Edge Cases ---")
     ou = calculate_ou_parameters(spread_mr, dt=1/6)
 
-    # Normal case
-    sc, bd = calculate_trade_score(0.30, ou, 0.01, -2.5, 0.75, 1.2, adf_passed=True)
-    print(f"Normal:         {sc}/100  {bd}")
+    # Quality Score
+    print("\n--- Quality Score ---")
+    q, qbd = calculate_quality_score(0.30, ou, 0.01, 0.75, 1.2, True)
+    print(f"Ideal pair:   Q={q}/100 {qbd}")
+    q, qbd = calculate_quality_score(0.50, ou, 0.10, 0.25, 37544, True, True)
+    print(f"Bad pair:     Q={q}/100 {qbd}")
 
-    # Hurst fallback
-    sc, bd = calculate_trade_score(0.50, ou, 0.01, -2.5, 0.75, 1.2, adf_passed=True, hurst_is_fallback=True)
-    print(f"Hurst fallback: {sc}/100  {bd}")
+    # Signal Score
+    print("\n--- Signal Score ---")
+    s, sbd = calculate_signal_score(-2.5, ou, "HIGH")
+    print(f"|Z|=2.5 HIGH: S={s}/100 {sbd}")
+    s, sbd = calculate_signal_score(-1.5, ou, "HIGH")
+    print(f"|Z|=1.5 HIGH: S={s}/100 {sbd}")
+    s, sbd = calculate_signal_score(-0.5, ou, "MEDIUM")
+    print(f"|Z|=0.5 MED:  S={s}/100 {sbd}")
 
-    # Z > 5 anomaly
-    sc, bd = calculate_trade_score(0.30, ou, 0.01, 11.5, 0.25, 45.0, adf_passed=True)
-    print(f"|Z|=11.5:       {sc}/100  {bd}")
+    # Adaptive Signal
+    print("\n--- Adaptive Signal ---")
+    for z, conf, q in [(-2.5, "HIGH", 60), (-1.8, "HIGH", 58),
+                        (-1.5, "HIGH", 55), (-1.2, "HIGH", 50),
+                        (2.1, "MEDIUM", 47), (1.5, "MEDIUM", 44),
+                        (11.5, "MEDIUM", 40)]:
+        state, dir, thr = get_adaptive_signal(z, conf, q)
+        print(f"  Z={z:+.1f} {conf:6s} Q={q}: {state:8s} {dir:5s} (thr={thr})")
 
-    # HR < 0
-    sc, bd = calculate_trade_score(0.30, ou, 0.01, -2.5, 1.0, -0.13, adf_passed=True)
-    print(f"HR<0:           {sc}/100  {bd}")
-
-    # Confidence
-    print("\n--- Confidence ---")
-    conf, checks, total = calculate_confidence(0.30, 1.0, True, True, -2.5, 1.2)
-    print(f"Best case:  {conf} ({checks}/{total})")
-    conf, checks, total = calculate_confidence(0.50, 0.25, True, False, 11.5, -0.13, hurst_is_fallback=True)
-    print(f"Worst case: {conf} ({checks}/{total})")
-
-    print("\n✅ v7.0.0 ready!")
+    print("\n✅ v8.0.0 ready!")
