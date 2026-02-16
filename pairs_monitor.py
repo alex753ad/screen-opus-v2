@@ -11,7 +11,7 @@ from statsmodels.regression.linear_model import OLS
 import warnings
 warnings.filterwarnings('ignore')
 
-# Импорт модуля mean reversion analysis v8.0
+# Импорт модуля mean reversion analysis v8.1
 from mean_reversion_analysis import (
     calculate_hurst_exponent,
     calculate_rolling_zscore,
@@ -22,6 +22,7 @@ from mean_reversion_analysis import (
     calculate_trade_score,
     calculate_confidence,
     get_adaptive_signal,
+    sanitize_pair,
     apply_fdr_correction,
     check_cointegration_stability,
     adf_test_spread,
@@ -331,8 +332,14 @@ class CryptoPairsScanner:
                 price_data[coin1].values, price_data[coin2].values
             )
             
-            # [D-A] HR > 100 → жёсткий cutoff
-            if abs(result['hedge_ratio']) > 100:
+            # [v8.1] Sanitizer — жёсткие исключения
+            san_ok, san_reason = sanitize_pair(
+                hedge_ratio=result['hedge_ratio'],
+                stability_passed=stability['windows_passed'],
+                stability_total=stability['total_windows'],
+                zscore=result['zscore']
+            )
+            if not san_ok:
                 continue
             
             # [NEW] ADF-тест спреда
@@ -360,18 +367,20 @@ class CryptoPairsScanner:
                 hurst_is_fallback=hurst_is_fallback
             )
             
-            # [D-B] Signal Score (момент)
+            # [v8.1] Signal Score (capped by Quality)
             s_score, s_breakdown = calculate_signal_score(
                 zscore=result['zscore'],
                 ou_params=ou_params,
-                confidence=confidence
+                confidence=confidence,
+                quality_score=q_score
             )
             
-            # [D-A] Adaptive Signal
+            # [v8.1] Adaptive Signal (TF-aware)
             state, direction, threshold = get_adaptive_signal(
                 zscore=result['zscore'],
                 confidence=confidence,
-                quality_score=q_score
+                quality_score=q_score,
+                timeframe=self.timeframe
             )
             
             halflife_hours = result['halflife'] * 24
@@ -488,7 +497,7 @@ def plot_spread_chart(spread_data, pair_name, zscore):
 # === ИНТЕРФЕЙС ===
 
 st.markdown('<p class="main-header">🔍 Crypto Pairs Trading Scanner</p>', unsafe_allow_html=True)
-st.caption("Версия 3.0.0 | 16 февраля 2026 | Quality/Signal Score + Adaptive Thresholds + DFA + ADF + FDR")
+st.caption("Версия 3.1.0 | 16 февраля 2026 | Sanitizers + TF-thresholds + Quality/Signal + DFA + ADF + FDR")
 st.markdown("---")
 
 # Sidebar - настройки

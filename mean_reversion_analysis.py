@@ -1,15 +1,14 @@
 """
 Модуль расчета Hurst Exponent и Ornstein-Uhlenbeck параметров
-ВЕРСИЯ v8.0.0: Quality/Signal Score + Adaptive Thresholds + HR Cutoff
+ВЕРСИЯ v8.1.0: Sanitizers + TF-aware Thresholds + Signal Cap
 
 Дата: 16 февраля 2026
 
-ИЗМЕНЕНИЯ v8.0.0:
-  [D-A] Adaptive Z-threshold по Confidence (HIGH→1.5, MEDIUM→2.0)
-  [D-A] Сигналы: SIGNAL/READY/WATCH/NEUTRAL
-  [D-B] Раздельные Quality Score и Signal Score
-  [D-A] HR > 100 → жёсткий cutoff
-  Всё из v7: DFA, ADF, FDR, Stability, Confidence, edge cases
+ИЗМЕНЕНИЯ v8.1.0:
+  [NEW] sanitize_pair() — жёсткие фильтры: HR≤0, HR=0, Stab=0/N, |Z|>10
+  [NEW] TF-aware пороги: 1h строже, 4h базовый, 1d с min Q≥50
+  [NEW] Signal Score capped: S = min(raw_S, Q * 1.2)
+  Всё из v8: Quality/Signal Score, Adaptive Signal, DFA, ADF, FDR, Stability
 """
 
 import numpy as np
@@ -327,25 +326,25 @@ def calculate_quality_score(hurst, ou_params, pvalue_adj, stability_score,
 # [D-B] SIGNAL SCORE — насколько сейчас хороший момент для входа
 # =============================================================================
 
-def calculate_signal_score(zscore, ou_params, confidence):
+def calculate_signal_score(zscore, ou_params, confidence, quality_score=100):
     """
     Signal Score (0-100) — оценка МОМЕНТА входа.
-
-    Меняется каждый скан. Высокий Signal = пора входить.
+    
+    v8.1: Cap по Quality — высокий Z на мусорной паре ≠ хороший сигнал.
+    Финальный S = min(raw_S, quality_score * 1.2)
 
     Компоненты:
-      Z-score сила:       40  — главный триггер
-      Скорость возврата:  30  — theta / OU half-life
-      Confidence бонус:   30  — HIGH усиливает сигнал
+      Z-score сила:       40
+      Скорость возврата:  30
+      Confidence бонус:   30
                          ----
                          100
     """
     bd = {}
 
-    # Z-score (40)
     az = abs(zscore)
     if az > 5.0:
-        bd['zscore'] = 10  # Аномалия — не доверяем
+        bd['zscore'] = 10
     elif az >= 3.0:
         bd['zscore'] = 40
     elif az >= 2.5:
@@ -359,23 +358,12 @@ def calculate_signal_score(zscore, ou_params, confidence):
     else:
         bd['zscore'] = 0
 
-    # OU speed (30)
     if ou_params is not None:
-        hl = ou_params['halflife_ou'] * 24  # часы
-        if hl <= 12:
-            bd['ou_speed'] = 30
-        elif hl <= 20:
-            bd['ou_speed'] = 25
-        elif hl <= 28:
-            bd['ou_speed'] = 15
-        elif hl <= 48:
-            bd['ou_speed'] = 8
-        else:
-            bd['ou_speed'] = 0
+        hl = ou_params['halflife_ou'] * 24
+        bd['ou_speed'] = 30 if hl <= 12 else 25 if hl <= 20 else 15 if hl <= 28 else 8 if hl <= 48 else 0
     else:
         bd['ou_speed'] = 0
 
-    # Confidence бонус (30)
     if confidence == "HIGH":
         bd['confidence'] = 30
     elif confidence == "MEDIUM":
@@ -383,49 +371,92 @@ def calculate_signal_score(zscore, ou_params, confidence):
     else:
         bd['confidence'] = 0
 
-    total = max(0, min(100, sum(bd.values())))
+    raw = max(0, min(100, sum(bd.values())))
+    
+    # Cap: Signal не может сильно превышать Quality
+    cap = int(quality_score * 1.2)
+    total = min(raw, cap)
+    bd['_cap'] = cap  # Для отладки
+    
     return int(total), bd
 
 
 # =============================================================================
-# [D-A] ADAPTIVE SIGNAL — определение торгового состояния
+# [v8.1] SANITIZER — жёсткие фильтры-исключения
 # =============================================================================
 
-def get_adaptive_signal(zscore, confidence, quality_score):
+def sanitize_pair(hedge_ratio, stability_passed, stability_total, zscore):
     """
-    Адаптивный торговый сигнал на основе Z-score, Confidence и Quality.
+    Жёсткий фильтр: пара исключается полностью если не проходит.
 
-    Состояния:
-      SIGNAL  — входить сейчас (сильное отклонение у качественной пары)
-      READY   — почти готово к входу (можно входить агрессивно)
-      WATCH   — мониторить, приближается к порогу
-      NEUTRAL — далеко от входа
+    Исключения:
+      HR <= 0:       не арбитраж (обе ноги в одну сторону)
+      HR == 0:       OLS не нашёл связи
+      Stab 0/N:      коинтеграция не подтверждена НИ В ОДНОМ окне
+      |Z| > 10:      сломанная модель
 
-    Пороги:
-      HIGH confidence + Quality >= 50:   SIGNAL при |Z|≥1.5, READY при |Z|≥1.2
-      MEDIUM confidence + Quality >= 40: SIGNAL при |Z|≥2.0, READY при |Z|≥1.5
-      LOW / low quality:                 SIGNAL при |Z|≥2.5, READY при |Z|≥2.0
+    Returns:
+        (passed, reason): True если OK, иначе причина исключения
+    """
+    if hedge_ratio <= 0:
+        return False, f"HR={hedge_ratio:.4f} ≤ 0"
+    if abs(hedge_ratio) < 1e-8:
+        return False, "HR ≈ 0"
+    if stability_total > 0 and stability_passed == 0:
+        return False, f"Stab=0/{stability_total}"
+    if abs(zscore) > 10:
+        return False, f"|Z|={abs(zscore):.1f} > 10"
+    return True, "OK"
+
+
+# =============================================================================
+# [v8.1] ADAPTIVE SIGNAL — TF-aware
+# =============================================================================
+
+def get_adaptive_signal(zscore, confidence, quality_score, timeframe='4h'):
+    """
+    Адаптивный торговый сигнал с учётом таймфрейма.
+
+    v8.1 TF-dependent thresholds:
+      1h (шумный):  HIGH→2.0, MEDIUM→2.5, LOW→3.0
+      4h (базовый): HIGH→1.5, MEDIUM→2.0, LOW→2.5
+      1d (дневной): HIGH→1.5, MEDIUM→2.0, LOW→2.5 + min Q≥50
 
     Returns:
         (state, direction, threshold_used)
-        state: SIGNAL/READY/WATCH/NEUTRAL
-        direction: LONG/SHORT/NONE
-        threshold_used: фактический порог для этой пары
     """
     az = abs(zscore)
     direction = "LONG" if zscore < 0 else "SHORT" if zscore > 0 else "NONE"
 
-    # Аномалия
     if az > 5.0:
         return "NEUTRAL", "NONE", 5.0
 
-    # Определяем пороги
-    if confidence == "HIGH" and quality_score >= 50:
-        t_signal, t_ready, t_watch = 1.5, 1.2, 0.8
-    elif confidence == "MEDIUM" and quality_score >= 40:
-        t_signal, t_ready, t_watch = 2.0, 1.5, 1.0
+    # TF-зависимые пороги
+    if timeframe == '1h':
+        # 1h шумнее — требуем больший Z
+        if confidence == "HIGH" and quality_score >= 50:
+            t_signal, t_ready, t_watch = 2.0, 1.5, 1.0
+        elif confidence == "MEDIUM" and quality_score >= 40:
+            t_signal, t_ready, t_watch = 2.5, 2.0, 1.5
+        else:
+            t_signal, t_ready, t_watch = 3.0, 2.5, 2.0
+    elif timeframe == '1d':
+        # 1d: как 4h, но требуем min Quality для SIGNAL
+        if confidence == "HIGH" and quality_score >= 50:
+            t_signal, t_ready, t_watch = 1.5, 1.2, 0.8
+        elif confidence == "MEDIUM" and quality_score >= 50:
+            # На 1d MEDIUM нужен Q≥50 (а не 40)
+            t_signal, t_ready, t_watch = 2.0, 1.5, 1.0
+        else:
+            t_signal, t_ready, t_watch = 2.5, 2.0, 1.5
     else:
-        t_signal, t_ready, t_watch = 2.5, 2.0, 1.5
+        # 4h — базовый
+        if confidence == "HIGH" and quality_score >= 50:
+            t_signal, t_ready, t_watch = 1.5, 1.2, 0.8
+        elif confidence == "MEDIUM" and quality_score >= 40:
+            t_signal, t_ready, t_watch = 2.0, 1.5, 1.0
+        else:
+            t_signal, t_ready, t_watch = 2.5, 2.0, 1.5
 
     if az >= t_signal:
         return "SIGNAL", direction, t_signal
@@ -502,43 +533,51 @@ def validate_ou_quality(ou_params, hurst=None, min_theta=0.1, max_halflife=100):
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  v8.0.0 — Quality/Signal Score + Adaptive Thresholds")
+    print("  v8.1.0 — Sanitizers + TF-aware + Signal Cap")
     print("=" * 60)
     np.random.seed(42)
 
-    # DFA
     spread_mr = [0.0]
     for i in range(250):
         dx = 0.8 * (0 - spread_mr[-1]) + 0.5 * np.random.randn()
         spread_mr.append(spread_mr[-1] + dx)
-    h = calculate_hurst_exponent(spread_mr)
-    print(f"\nDFA MR: H={h:.4f}")
-
     ou = calculate_ou_parameters(spread_mr, dt=1/6)
 
-    # Quality Score
-    print("\n--- Quality Score ---")
-    q, qbd = calculate_quality_score(0.30, ou, 0.01, 0.75, 1.2, True)
-    print(f"Ideal pair:   Q={q}/100 {qbd}")
-    q, qbd = calculate_quality_score(0.50, ou, 0.10, 0.25, 37544, True, True)
-    print(f"Bad pair:     Q={q}/100 {qbd}")
+    # Sanitizer
+    print("\n--- Sanitizer ---")
+    tests = [
+        (1.2,   3, 4, 2.0),   # OK
+        (-0.02, 3, 4, 1.5),   # HR < 0
+        (0.0,   2, 4, 2.0),   # HR = 0
+        (5.0,   0, 4, 2.0),   # Stab 0/4
+        (1.0,   2, 4, 11.5),  # |Z| > 10
+    ]
+    for hr, sp, st, z in tests:
+        ok, reason = sanitize_pair(hr, sp, st, z)
+        print(f"  HR={hr:>8.4f} Stab={sp}/{st} Z={z:>5.1f} → {'✅' if ok else '❌'} {reason}")
 
-    # Signal Score
-    print("\n--- Signal Score ---")
-    s, sbd = calculate_signal_score(-2.5, ou, "HIGH")
-    print(f"|Z|=2.5 HIGH: S={s}/100 {sbd}")
-    s, sbd = calculate_signal_score(-1.5, ou, "HIGH")
-    print(f"|Z|=1.5 HIGH: S={s}/100 {sbd}")
-    s, sbd = calculate_signal_score(-0.5, ou, "MEDIUM")
-    print(f"|Z|=0.5 MED:  S={s}/100 {sbd}")
+    # TF-aware thresholds
+    print("\n--- TF-aware Adaptive Signal ---")
+    cases = [
+        # (z, conf, q, tf)
+        (1.51,  "HIGH",   83, "1h"),  # NEAR/ENA — was SIGNAL, now WATCH (1h stricter)
+        (1.51,  "HIGH",   83, "4h"),  # Same pair on 4h — SIGNAL
+        (-2.85, "HIGH",   68, "4h"),  # ETH/BETH 4h — SIGNAL
+        (-1.6,  "HIGH",   63, "4h"),  # LIT/ATOM — SIGNAL
+        (4.38,  "HIGH",   90, "1d"),  # UMA/AR 1d HIGH — SIGNAL
+        (2.31,  "MEDIUM", 58, "1d"),  # MOVE/DOT 1d MED Q=58 — SIGNAL
+        (2.09,  "MEDIUM", 40, "1d"),  # VIRTUAL/ICP 1d MED Q=40 — needs Q>=50, so READY
+        (-3.86, "MEDIUM", 44, "1h"),  # SUI/SENT 1h MED — SIGNAL (>2.5)
+    ]
+    for z, conf, q, tf in cases:
+        state, dir, thr = get_adaptive_signal(z, conf, q, tf)
+        print(f"  Z={z:>+5.2f} {conf:6s} Q={q:>2} TF={tf:>2s} → {state:8s} {dir:5s} thr={thr}")
 
-    # Adaptive Signal
-    print("\n--- Adaptive Signal ---")
-    for z, conf, q in [(-2.5, "HIGH", 60), (-1.8, "HIGH", 58),
-                        (-1.5, "HIGH", 55), (-1.2, "HIGH", 50),
-                        (2.1, "MEDIUM", 47), (1.5, "MEDIUM", 44),
-                        (11.5, "MEDIUM", 40)]:
-        state, dir, thr = get_adaptive_signal(z, conf, q)
-        print(f"  Z={z:+.1f} {conf:6s} Q={q}: {state:8s} {dir:5s} (thr={thr})")
+    # Signal cap
+    print("\n--- Signal Cap by Quality ---")
+    s1, _ = calculate_signal_score(-3.86, ou, "MEDIUM", quality_score=44)
+    s2, _ = calculate_signal_score(-3.86, ou, "MEDIUM", quality_score=90)
+    print(f"  |Z|=3.86 MED Q=44 → S={s1} (capped at {int(44*1.2)})")
+    print(f"  |Z|=3.86 MED Q=90 → S={s2} (cap={int(90*1.2)}, no effect)")
 
-    print("\n✅ v8.0.0 ready!")
+    print("\n✅ v8.1.0 ready!")
