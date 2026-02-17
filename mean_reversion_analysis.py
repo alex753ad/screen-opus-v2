@@ -1,14 +1,14 @@
 """
 Модуль расчета Hurst Exponent и Ornstein-Uhlenbeck параметров
-ВЕРСИЯ v10.1.0: Min-Q gate + HR uncertainty filter + N-bars hard gate
+ВЕРСИЯ v10.2.0: Q gate↑40, HR ceiling↓50
 
 Дата: 17 февраля 2026
 
-ИЗМЕНЕНИЯ v10.1.0:
-  [FIX] get_adaptive_signal() — Q < 20 → принудительно NEUTRAL
-  [FIX] sanitize_pair() — N < 30 → hard exclude
-  [NEW] calculate_confidence() — HR uncertainty (hr_std/hr > 0.5) снижает conf
-  [MOD] Quality Score — hr_uncertainty_penalty
+ИЗМЕНЕНИЯ v10.2.0:
+  [FIX] get_adaptive_signal() — Q < 40 → max READY (was 25). Q < 30 → NEUTRAL (was 20)
+  [FIX] sanitize_pair() — |HR| > 50 → exclude (was 100)
+  [FIX] calculate_quality_score() — HR scoring aligned с ceiling 50
+  Всё из v10.1: Min-Q gate, HR uncertainty, N-bars hard gate
   Всё из v10.0: Adaptive Robust Z, Crossing Density, Correlation, Kalman HR
 """
 
@@ -602,7 +602,7 @@ def calculate_quality_score(hurst, ou_params, pvalue_adj, stability_score,
     bd['adf'] = 15 if adf_passed else 0
 
     # Hedge ratio (15)
-    if hedge_ratio <= 0 or abs(hedge_ratio) > 100:
+    if hedge_ratio <= 0 or abs(hedge_ratio) > 50:
         bd['hedge_ratio'] = 0
     elif 0.2 <= abs(hedge_ratio) <= 5.0:
         bd['hedge_ratio'] = 15
@@ -706,16 +706,11 @@ def sanitize_pair(hedge_ratio, stability_passed, stability_total, zscore,
     Исключения:
       HR <= 0:        не арбитраж
       |HR| < 0.001:   экономически бессмысленный HR
-      |HR| > 100:     фактически односторонняя ставка
+      |HR| > 50:      фактически односторонняя ставка (50 единиц на 1)
       Stab 0/N:       коинтеграция не подтверждена ни в одном окне
       |Z| > 10:       сломанная модель
       N < 30:         слишком мало данных для любой статистики
       HR uncertainty > 100%: Калман не уверен в связи
-
-    Мягкие штрафы (через Quality Score):
-      N < 50:         penalty -15 в Quality
-      Crossing < 0.03: penalty -10 в Quality
-      HR uncertainty > 50%: penalty -10 в Quality
 
     Returns:
         (passed, reason)
@@ -724,8 +719,8 @@ def sanitize_pair(hedge_ratio, stability_passed, stability_total, zscore,
         return False, f"HR={hedge_ratio:.4f} ≤ 0"
     if abs(hedge_ratio) < 0.001:
         return False, f"|HR|={abs(hedge_ratio):.6f} < 0.001"
-    if abs(hedge_ratio) > 100:
-        return False, f"|HR|={abs(hedge_ratio):.0f} > 100"
+    if abs(hedge_ratio) > 50:
+        return False, f"|HR|={abs(hedge_ratio):.1f} > 50"
     if stability_total > 0 and stability_passed == 0:
         return False, f"Stab=0/{stability_total}"
     if abs(zscore) > 10:
@@ -764,10 +759,10 @@ def get_adaptive_signal(zscore, confidence, quality_score, timeframe='4h'):
     az = abs(zscore)
     direction = "LONG" if zscore < 0 else "SHORT" if zscore > 0 else "NONE"
 
-    # v10.1: Hard guards
+    # v10.2: Hard guards
     if az > 5.0:
         return "NEUTRAL", "NONE", 5.0
-    if quality_score < 20:
+    if quality_score < 30:
         # Мусорная пара — даже при экстремальном Z не давать сигнал
         return "NEUTRAL", "NONE", 99.0
 
@@ -799,8 +794,8 @@ def get_adaptive_signal(zscore, confidence, quality_score, timeframe='4h'):
             t_signal, t_ready, t_watch = 2.5, 2.0, 1.5
 
     if az >= t_signal:
-        # v10: Quality gate — SIGNAL requires minimum quality
-        if quality_score < 25:
+        # v10.2: Quality gate — SIGNAL requires minimum quality
+        if quality_score < 40:
             return "READY", direction, t_signal  # downgrade: too low quality for SIGNAL
         return "SIGNAL", direction, t_signal
     elif az >= t_ready:

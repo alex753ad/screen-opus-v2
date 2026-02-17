@@ -265,9 +265,12 @@ class CryptoPairsScanner:
                 spread.values, halflife_bars=hl_bars
             )
 
-            # v10: Rolling correlation (информационная)
+            # v10.2: Rolling correlation — TF-aware window
+            corr_windows = {'1h': 120, '2h': 60, '4h': 60, '1d': 30, '15m': 360}
+            corr_w = corr_windows.get(self.timeframe, 60)
+            corr_w = min(corr_w, len(s1) // 3)
             corr, corr_series = calculate_rolling_correlation(
-                s1.values, s2.values, window=min(30, len(s1) // 3)
+                s1.values, s2.values, window=max(10, corr_w)
             )
 
             return {
@@ -506,6 +509,32 @@ class CryptoPairsScanner:
         signal_order = {'SIGNAL': 0, 'READY': 1, 'WATCH': 2, 'NEUTRAL': 3}
         results.sort(key=lambda x: (signal_order.get(x['signal'], 4), -x['quality_score']))
         
+        # v10.2: Cluster detection — найти активы, повторяющиеся в 3+ SIGNAL-парах
+        signal_pairs = [r for r in results if r['signal'] == 'SIGNAL']
+        if signal_pairs:
+            from collections import Counter
+            coin_counts = Counter()
+            for r in signal_pairs:
+                coin_counts[r['coin1']] += 1
+                coin_counts[r['coin2']] += 1
+            # Кластеры: актив в 3+ SIGNAL-парах
+            clusters = {coin: count for coin, count in coin_counts.items() if count >= 3}
+            # Пометить каждую пару кластером
+            for r in results:
+                cluster_coins = []
+                if r['coin1'] in clusters:
+                    cluster_coins.append(f"{r['coin1']}({clusters[r['coin1']]})")
+                if r['coin2'] in clusters:
+                    cluster_coins.append(f"{r['coin2']}({clusters[r['coin2']]})")
+                r['cluster'] = ', '.join(cluster_coins) if cluster_coins else ''
+            
+            if clusters:
+                cluster_msg = ', '.join(f"**{c}** ({n} пар)" for c, n in clusters.most_common())
+                st.warning(f"🔗 Кластеры в SIGNAL: {cluster_msg} — это не {sum(clusters.values())} независимых сделок!")
+        else:
+            for r in results:
+                r['cluster'] = ''
+        
         if len(results) > 0:
             st.success(f"✅ Найдено {len(results)} пар (FDR: {total_fdr_passed} подтверждены)")
         
@@ -570,7 +599,7 @@ def plot_spread_chart(spread_data, pair_name, zscore):
 # === ИНТЕРФЕЙС ===
 
 st.markdown('<p class="main-header">🔍 Crypto Pairs Trading Scanner</p>', unsafe_allow_html=True)
-st.caption("Версия 5.1.0 | 17 февраля 2026 | Min-Q gate + HR uncertainty + N-bars hard gate + Adaptive Z + Crossing Density + Kalman HR")
+st.caption("Версия 5.2.0 | 17 февраля 2026 | Q gate↑40 + HR ceiling↓50 + Cluster detect + TF-aware correlation")
 st.markdown("---")
 
 # Sidebar - настройки
