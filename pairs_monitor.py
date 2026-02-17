@@ -409,6 +409,10 @@ class CryptoPairsScanner:
             
             halflife_hours = result['halflife'] * 24
             
+            # v9.1: количество баров и Z-warning
+            n_bars = len(result['spread']) if result.get('spread') is not None else 0
+            z_warning = abs(result['zscore']) > 4.0  # approaching anomaly
+            
             results.append({
                 'pair': f"{coin1}/{coin2}",
                 'coin1': coin1,
@@ -454,6 +458,9 @@ class CryptoPairsScanner:
                 'use_kalman': result.get('use_kalman', False),
                 'hr_std': result.get('hr_std', 0.0),
                 'hr_series': result.get('hr_series'),
+                # v9.1
+                'n_bars': n_bars,
+                'z_warning': z_warning,
             })
         
         # Сортируем: сначала по Signal (SIGNAL > READY > WATCH > NEUTRAL), потом по Quality
@@ -524,7 +531,7 @@ def plot_spread_chart(spread_data, pair_name, zscore):
 # === ИНТЕРФЕЙС ===
 
 st.markdown('<p class="main-header">🔍 Crypto Pairs Trading Scanner</p>', unsafe_allow_html=True)
-st.caption("Версия 4.0.0 | 17 февраля 2026 | Kalman HR + Sanitizers + TF-thresholds + Quality/Signal + DFA + ADF + FDR")
+st.caption("Версия 4.1.0 | 17 февраля 2026 | HR floor + N bars + Z warning + Kalman HR + Sanitizers + TF-thresholds")
 st.markdown("---")
 
 # Sidebar - настройки
@@ -862,12 +869,13 @@ if st.session_state.pairs_data is not None:
                 else '∞'
             ),
             'HR': round(p['hedge_ratio'], 4),
+            'N': p.get('n_bars', 0),
         } for p in pairs])
     else:
         # Пустая таблица если нет пар
         df_display = pd.DataFrame(columns=[
             'Пара', 'Статус', 'Dir', 'Q', 'S', 'Conf', 'Z', 'Thr',
-            'FDR', 'ADF', 'KF', 'Hurst', 'Stab', 'HL', 'HR'
+            'FDR', 'ADF', 'KF', 'Hurst', 'Stab', 'HL', 'HR', 'N'
         ])
     
     # Функция для выбора строки
@@ -940,10 +948,15 @@ if st.session_state.pairs_data is not None:
         warnings_list.append("⚠️ Hurst = 0.5 (DFA fallback — данных недостаточно)")
     if abs(selected_data['zscore']) > 5:
         warnings_list.append(f"⚠️ |Z| = {abs(selected_data['zscore']):.1f} > 5 — аномалия")
+    elif selected_data.get('z_warning', False):
+        warnings_list.append(f"⚠️ |Z| = {abs(selected_data['zscore']):.1f} > 4.0 — приближается к аномалии, возможен структурный сдвиг")
     if not selected_data.get('fdr_passed', False):
         warnings_list.append("⚠️ FDR не пройден — коинтеграция ненадёжна")
     if not selected_data.get('adf_passed', False):
         warnings_list.append("⚠️ ADF: спред нестационарен")
+    n_bars = selected_data.get('n_bars', 0)
+    if 0 < n_bars < 100:
+        warnings_list.append(f"⚠️ Мало данных: {n_bars} баров (< 100). Результаты менее надёжны")
     if warnings_list:
         st.warning("\n".join(warnings_list))
     
@@ -970,10 +983,13 @@ if st.session_state.pairs_data is not None:
             st.caption(" | ".join([f"{k}:{v}" for k, v in s_bd.items()]))
     
     # ═══════ МЕТРИКИ ═══════
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
     
     with col1:
-        st.metric("Z-Score", f"{selected_data['zscore']:.2f}")
+        z_str = f"{selected_data['zscore']:.2f}"
+        if selected_data.get('z_warning', False):
+            z_str += " ⚠️"
+        st.metric("Z-Score", z_str)
     with col2:
         st.metric("P-adj", f"{selected_data.get('pvalue_adj', selected_data['pvalue']):.4f}")
     with col3:
@@ -983,6 +999,10 @@ if st.session_state.pairs_data is not None:
         st.metric("Confidence", f"{conf} ({selected_data.get('conf_checks', 0)}/{selected_data.get('conf_total', 6)})")
     with col5:
         st.metric("Порог Z", f"±{threshold}")
+    with col6:
+        n_bars = selected_data.get('n_bars', 0)
+        bars_emoji = "🟢" if n_bars >= 300 else "🟡" if n_bars >= 100 else "🔴"
+        st.metric("Баров", f"{n_bars} {bars_emoji}")
     
     # ═══════ MEAN REVERSION ANALYSIS v8.0 ═══════
     if 'hurst' in selected_data and 'theta' in selected_data:
@@ -1283,6 +1303,6 @@ else:
 # Footer
 st.markdown("---")
 st.caption("⚠️ Disclaimer: Этот инструмент предназначен только для образовательных целей. Не является финансовой рекомендацией.")
-# VERSION: 4.0
+# VERSION: 4.1
 # LAST UPDATED: 2026-02-17
-# FEATURES: Kalman Filter HR, sanitizers (HR≤0/HR>100/Stab0), TF-aware thresholds, Quality/Signal dual score, adaptive Z-thresholds, DFA, ADF, FDR, stability, confidence, default 90d lookback
+# FEATURES: HR floor (<0.001), N bars indicator, Z>4 warning, Kalman Filter HR, sanitizers, TF-aware thresholds, Quality/Signal, DFA, ADF, FDR, 90d default

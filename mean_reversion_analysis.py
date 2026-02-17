@@ -1,14 +1,13 @@
 """
 Модуль расчета Hurst Exponent и Ornstein-Uhlenbeck параметров
-ВЕРСИЯ v9.0.0: Kalman Filter HR + Sanitizer fix + TF-aware
+ВЕРСИЯ v9.1.0: HR floor + bars indicator + Z anomaly warning
 
 Дата: 17 февраля 2026
 
-ИЗМЕНЕНИЯ v9.0.0:
-  [NEW] kalman_hedge_ratio() — адаптивный HR через Kalman Filter
-  [NEW] kalman_select_delta() — автоподбор delta по log-likelihood
-  [FIX] sanitize_pair() — добавлен |HR| > 100
-  Всё из v8.1: Sanitizers, TF-aware пороги, Quality/Signal Score, Signal Cap
+ИЗМЕНЕНИЯ v9.1.0:
+  [FIX] sanitize_pair() — |HR| < 0.001 → exclude (PEPE/LTC, SPACE/ZEC fix)
+  [NEW] get_adaptive_signal() — z_warning при |Z| > 4.0
+  Всё из v9.0: Kalman Filter HR, Sanitizers, TF-aware, Quality/Signal, Signal Cap
 """
 
 import numpy as np
@@ -542,19 +541,19 @@ def sanitize_pair(hedge_ratio, stability_passed, stability_total, zscore):
     Жёсткий фильтр: пара исключается полностью если не проходит.
 
     Исключения:
-      HR <= 0:       не арбитраж
-      HR == 0:       OLS не нашёл связи
-      |HR| > 100:    фактически односторонняя ставка
-      Stab 0/N:      коинтеграция не подтверждена ни в одном окне
-      |Z| > 10:      сломанная модель
+      HR <= 0:        не арбитраж
+      |HR| < 0.001:   экономически бессмысленный HR (нужно 1000+ единиц)
+      |HR| > 100:     фактически односторонняя ставка
+      Stab 0/N:       коинтеграция не подтверждена ни в одном окне
+      |Z| > 10:       сломанная модель
 
     Returns:
         (passed, reason)
     """
     if hedge_ratio <= 0:
         return False, f"HR={hedge_ratio:.4f} ≤ 0"
-    if abs(hedge_ratio) < 1e-8:
-        return False, "HR ≈ 0"
+    if abs(hedge_ratio) < 0.001:
+        return False, f"|HR|={abs(hedge_ratio):.6f} < 0.001"
     if abs(hedge_ratio) > 100:
         return False, f"|HR|={abs(hedge_ratio):.0f} > 100"
     if stability_total > 0 and stability_passed == 0:
