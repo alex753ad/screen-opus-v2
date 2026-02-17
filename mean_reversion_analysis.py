@@ -1,13 +1,15 @@
 """
 Модуль расчета Hurst Exponent и Ornstein-Uhlenbeck параметров
-ВЕРСИЯ v9.1.0: HR floor + bars indicator + Z anomaly warning
+ВЕРСИЯ v10.1.0: Min-Q gate + HR uncertainty filter + N-bars hard gate
 
 Дата: 17 февраля 2026
 
-ИЗМЕНЕНИЯ v9.1.0:
-  [FIX] sanitize_pair() — |HR| < 0.001 → exclude (PEPE/LTC, SPACE/ZEC fix)
-  [NEW] get_adaptive_signal() — z_warning при |Z| > 4.0
-  Всё из v9.0: Kalman Filter HR, Sanitizers, TF-aware, Quality/Signal, Signal Cap
+ИЗМЕНЕНИЯ v10.1.0:
+  [FIX] get_adaptive_signal() — Q < 20 → принудительно NEUTRAL
+  [FIX] sanitize_pair() — N < 30 → hard exclude
+  [NEW] calculate_confidence() — HR uncertainty (hr_std/hr > 0.5) снижает conf
+  [MOD] Quality Score — hr_uncertainty_penalty
+  Всё из v10.0: Adaptive Robust Z, Crossing Density, Correlation, Kalman HR
 """
 
 import numpy as np
@@ -90,7 +92,7 @@ def calculate_hurst_exponent(time_series, min_window=4):
 # =============================================================================
 
 def calculate_rolling_zscore(spread, window=30):
-    """Rolling Z-score без lookahead bias."""
+    """Rolling Z-score без lookahead bias. LEGACY — используйте adaptive версию."""
     spread = np.array(spread, dtype=float)
     n = len(spread)
     if n < window + 1:
@@ -108,6 +110,130 @@ def calculate_rolling_zscore(spread, window=30):
 
     cz = zscore_series[-1]
     return float(0.0 if np.isnan(cz) else cz), zscore_series
+
+
+def calculate_adaptive_robust_zscore(spread, halflife_bars=None, min_w=10, max_w=60):
+    """
+    Адаптивный робастный Z-score.
+
+    Два улучшения над calculate_rolling_zscore:
+      1. Адаптивное окно: Window = clip(2.5 × HL_bars, min_w, max_w)
+         Синхронизирует Z-score с ритмом конкретной пары.
+      2. MAD вместо std: устойчив к выбросам (fat tails крипто).
+         MAD * 1.4826 ≈ sigma для нормального распределения.
+
+    Args:
+        spread: массив спреда
+        halflife_bars: HL в барах (не часах!). None → default window.
+        min_w: минимальное окно (10 — порог стабильности)
+        max_w: максимальное окно (60 — не слишком далеко)
+
+    Returns:
+        (current_z, z_series, window_used)
+    """
+    spread = np.array(spread, dtype=float)
+    n = len(spread)
+
+    # 1. Адаптивное окно
+    if halflife_bars is not None and 0 < halflife_bars < 500:
+        window = int(np.clip(round(2.5 * halflife_bars), min_w, max_w))
+    else:
+        window = 30  # fallback
+
+    if n < window + 1:
+        # Мало данных — простой Z
+        med = np.median(spread)
+        mad = np.median(np.abs(spread - med)) * 1.4826
+        if mad < 1e-10:
+            return 0.0, np.zeros(n), window
+        zs = (spread - med) / mad
+        return float(zs[-1]), zs, window
+
+    # 2. Rolling MAD Z-score
+    zscore_series = np.full(n, np.nan)
+    for i in range(window, n):
+        lb = spread[i - window:i]
+        med = np.median(lb)
+        mad = np.median(np.abs(lb - med)) * 1.4826
+
+        if mad < 1e-10:
+            # fallback на std если MAD = 0 (стейблкоины)
+            s = np.std(lb)
+            zscore_series[i] = (spread[i] - np.mean(lb)) / s if s > 1e-10 else 0.0
+        else:
+            zscore_series[i] = (spread[i] - med) / mad
+
+    cz = zscore_series[-1]
+    return float(0.0 if np.isnan(cz) else cz), zscore_series, window
+
+
+def calculate_crossing_density(zscore_series, window=None):
+    """
+    Частота пересечений нуля Z-score.
+
+    Показывает как часто спред реально переходит через mean.
+    Высокая плотность → пара активно mean-reverting.
+    Низкая плотность → спред "застрял" на одной стороне.
+
+    Args:
+        zscore_series: массив Z-scores
+        window: количество последних баров для анализа
+
+    Returns:
+        float: плотность (0.0–1.0). 0.05 = 5% баров содержат кроссинг.
+    """
+    z = np.array(zscore_series, dtype=float)
+    z = z[~np.isnan(z)]
+
+    if len(z) < 10:
+        return 0.0
+
+    if window is not None and len(z) > window:
+        z = z[-window:]
+
+    # Считаем смены знака
+    signs = np.sign(z)
+    # Убираем нули (на нуле — не считается сменой)
+    signs = signs[signs != 0]
+    if len(signs) < 2:
+        return 0.0
+
+    crossings = np.sum(np.abs(np.diff(signs)) > 0)
+    return float(crossings / len(signs))
+
+
+def calculate_rolling_correlation(series1, series2, window=30):
+    """
+    Rolling корреляция Пирсона между двумя ценовыми рядами.
+
+    НЕ используется как фильтр (коинтегрированные пары могут
+    временно раскоррелироваться — это момент входа).
+    Показывается в UI как информационный индикатор.
+
+    Returns:
+        (current_corr, corr_series)
+    """
+    s1 = np.array(series1, dtype=float)
+    s2 = np.array(series2, dtype=float)
+    n = min(len(s1), len(s2))
+
+    if n < window + 1:
+        if n > 5:
+            return float(np.corrcoef(s1[:n], s2[:n])[0, 1]), np.array([])
+        return 0.0, np.array([])
+
+    s1, s2 = s1[:n], s2[:n]
+    corr_series = np.full(n, np.nan)
+
+    for i in range(window, n):
+        x = s1[i - window:i]
+        y = s2[i - window:i]
+        sx, sy = np.std(x), np.std(y)
+        if sx > 1e-10 and sy > 1e-10:
+            corr_series[i] = np.corrcoef(x, y)[0, 1]
+
+    cc = corr_series[-1]
+    return float(0.0 if np.isnan(cc) else cc), corr_series
 
 
 # =============================================================================
@@ -386,9 +512,15 @@ def check_cointegration_stability(series1, series2, window_fraction=0.6):
 # =============================================================================
 
 def calculate_confidence(hurst, stability_score, fdr_passed, adf_passed,
-                         zscore, hedge_ratio, hurst_is_fallback=False):
-    """HIGH / MEDIUM / LOW на основе 6 критериев."""
+                         zscore, hedge_ratio, hurst_is_fallback=False,
+                         hr_std=None):
+    """
+    HIGH / MEDIUM / LOW на основе 7 критериев.
+    
+    v10.1: добавлен критерий HR uncertainty (hr_std/hr < 0.5)
+    """
     checks = 0
+    total_checks = 7
     if fdr_passed:
         checks += 1
     if adf_passed:
@@ -401,13 +533,20 @@ def calculate_confidence(hurst, stability_score, fdr_passed, adf_passed,
         checks += 1
     if 1.5 <= abs(zscore) <= 5.0:
         checks += 1
-
-    if checks >= 5:
-        return "HIGH", checks, 6
-    elif checks >= 3:
-        return "MEDIUM", checks, 6
+    # v10.1: HR uncertainty — Калман уверен в хедже?
+    if hr_std is not None and hedge_ratio > 0:
+        hr_unc = hr_std / hedge_ratio
+        if hr_unc < 0.5:  # uncertainty < 50%
+            checks += 1
     else:
-        return "LOW", checks, 6
+        checks += 1  # нет данных — не штрафуем (OLS fallback)
+
+    if checks >= 6:
+        return "HIGH", checks, total_checks
+    elif checks >= 4:
+        return "MEDIUM", checks, total_checks
+    else:
+        return "LOW", checks, total_checks
 
 
 # =============================================================================
@@ -416,12 +555,12 @@ def calculate_confidence(hurst, stability_score, fdr_passed, adf_passed,
 
 def calculate_quality_score(hurst, ou_params, pvalue_adj, stability_score,
                             hedge_ratio, adf_passed=None,
-                            hurst_is_fallback=False):
+                            hurst_is_fallback=False,
+                            crossing_density=None,
+                            n_bars=None,
+                            hr_std=None):
     """
     Quality Score (0-100) — оценка ПАРЫ, без привязки к текущему Z.
-
-    Это "стационарная" метрика: если пара качественная, она будет
-    качественной и завтра. Используется для Watchlist.
 
     Компоненты:
       FDR p-value:    25  — статистическая надёжность коинтеграции
@@ -431,6 +570,11 @@ def calculate_quality_score(hurst, ou_params, pvalue_adj, stability_score,
       Hedge ratio:    15  — практичность для торговли
                      ----
                      100
+
+    Модификаторы:
+      Crossing density < 0.03 → -10 (спред застрял на одной стороне)
+      N < 50 баров → -15 (мало данных, ненадёжная статистика)
+      HR uncertainty > 50% → -10 (Калман не уверен в хедже)
     """
     bd = {}
 
@@ -468,6 +612,24 @@ def calculate_quality_score(hurst, ou_params, pvalue_adj, stability_score,
         bd['hedge_ratio'] = 5
     else:
         bd['hedge_ratio'] = 2
+
+    # Crossing density modifier
+    if crossing_density is not None and crossing_density < 0.03:
+        bd['crossing_penalty'] = -10
+    else:
+        bd['crossing_penalty'] = 0
+
+    # Data depth modifier
+    if n_bars is not None and n_bars < 50:
+        bd['data_penalty'] = -15
+    else:
+        bd['data_penalty'] = 0
+
+    # HR uncertainty modifier (v10.1)
+    if hr_std is not None and hedge_ratio > 0 and hr_std / hedge_ratio > 0.5:
+        bd['hr_unc_penalty'] = -10
+    else:
+        bd['hr_unc_penalty'] = 0
 
     total = max(0, min(100, sum(bd.values())))
     return int(total), bd
@@ -536,16 +698,24 @@ def calculate_signal_score(zscore, ou_params, confidence, quality_score=100):
 # [v8.1] SANITIZER — жёсткие фильтры-исключения
 # =============================================================================
 
-def sanitize_pair(hedge_ratio, stability_passed, stability_total, zscore):
+def sanitize_pair(hedge_ratio, stability_passed, stability_total, zscore,
+                  n_bars=None, hr_std=None):
     """
     Жёсткий фильтр: пара исключается полностью если не проходит.
 
     Исключения:
       HR <= 0:        не арбитраж
-      |HR| < 0.001:   экономически бессмысленный HR (нужно 1000+ единиц)
+      |HR| < 0.001:   экономически бессмысленный HR
       |HR| > 100:     фактически односторонняя ставка
       Stab 0/N:       коинтеграция не подтверждена ни в одном окне
       |Z| > 10:       сломанная модель
+      N < 30:         слишком мало данных для любой статистики
+      HR uncertainty > 100%: Калман не уверен в связи
+
+    Мягкие штрафы (через Quality Score):
+      N < 50:         penalty -15 в Quality
+      Crossing < 0.03: penalty -10 в Quality
+      HR uncertainty > 50%: penalty -10 в Quality
 
     Returns:
         (passed, reason)
@@ -560,6 +730,14 @@ def sanitize_pair(hedge_ratio, stability_passed, stability_total, zscore):
         return False, f"Stab=0/{stability_total}"
     if abs(zscore) > 10:
         return False, f"|Z|={abs(zscore):.1f} > 10"
+    # v10.1: Hard minimum bars
+    if n_bars is not None and n_bars < 30:
+        return False, f"N={n_bars} < 30 баров"
+    # v10.1: HR uncertainty > 100% — Калман не нашёл стабильную связь
+    if hr_std is not None and hr_std > 0 and hedge_ratio > 0:
+        hr_unc = hr_std / hedge_ratio
+        if hr_unc > 1.0:
+            return False, f"HR uncertainty {hr_unc:.0%} > 100%"
     return True, "OK"
 
 
@@ -570,6 +748,10 @@ def sanitize_pair(hedge_ratio, stability_passed, stability_total, zscore):
 def get_adaptive_signal(zscore, confidence, quality_score, timeframe='4h'):
     """
     Адаптивный торговый сигнал с учётом таймфрейма.
+
+    v10.1: Hard guards:
+      Q < 20 → NEUTRAL (мусор не может быть SIGNAL/READY)
+      |Z| > 5 → NEUTRAL (аномалия)
 
     v8.1 TF-dependent thresholds:
       1h (шумный):  HIGH→2.0, MEDIUM→2.5, LOW→3.0
@@ -582,8 +764,12 @@ def get_adaptive_signal(zscore, confidence, quality_score, timeframe='4h'):
     az = abs(zscore)
     direction = "LONG" if zscore < 0 else "SHORT" if zscore > 0 else "NONE"
 
+    # v10.1: Hard guards
     if az > 5.0:
         return "NEUTRAL", "NONE", 5.0
+    if quality_score < 20:
+        # Мусорная пара — даже при экстремальном Z не давать сигнал
+        return "NEUTRAL", "NONE", 99.0
 
     # TF-зависимые пороги
     if timeframe == '1h':
@@ -613,6 +799,9 @@ def get_adaptive_signal(zscore, confidence, quality_score, timeframe='4h'):
             t_signal, t_ready, t_watch = 2.5, 2.0, 1.5
 
     if az >= t_signal:
+        # v10: Quality gate — SIGNAL requires minimum quality
+        if quality_score < 25:
+            return "READY", direction, t_signal  # downgrade: too low quality for SIGNAL
         return "SIGNAL", direction, t_signal
     elif az >= t_ready:
         return "READY", direction, t_signal
@@ -686,75 +875,87 @@ def validate_ou_quality(ou_params, hurst=None, min_theta=0.1, max_halflife=100):
 # =============================================================================
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("  v9.0.0 — Kalman Filter HR + Sanitizer fix")
-    print("=" * 60)
+    print("=" * 65)
+    print("  v10.0.0 — Adaptive Robust Z + Crossing Density + Correlation")
+    print("=" * 65)
     np.random.seed(42)
 
-    # Generate synthetic cointegrated pair
-    n = 500
-    s2 = np.cumsum(np.random.randn(n) * 0.5) + 50  # random walk asset 2
-    true_hr = np.linspace(1.2, 1.8, n)  # DRIFTING hedge ratio
-    noise = np.random.randn(n) * 0.3
-    s1 = true_hr * s2 + 5.0 + noise  # asset 1 = HR * asset2 + intercept + noise
+    # Generate synthetic mean-reverting spread
+    n = 300
+    spread_mr = [0.0]
+    for i in range(n - 1):
+        dx = 0.3 * (0 - spread_mr[-1]) + 0.5 * np.random.randn()
+        spread_mr.append(spread_mr[-1] + dx)
+    spread_mr = np.array(spread_mr)
 
-    # OLS (static)
-    from scipy import stats as sp_stats
-    slope_ols, intercept_ols, _, _, _ = sp_stats.linregress(s2, s1)
-    spread_ols = s1 - slope_ols * s2 - intercept_ols
+    # OU params for HL
+    ou = calculate_ou_parameters(spread_mr, dt=1/6)  # 4h
+    hl_bars = ou['halflife_ou'] / (4.0) if ou else 10  # HL_hours / hours_per_bar
 
-    # Kalman
-    print("\n--- Kalman vs OLS ---")
-    kf = kalman_hedge_ratio(s1, s2, delta=1e-4)
-    if kf:
-        print(f"OLS HR (static):     {slope_ols:.4f}")
-        print(f"Kalman HR (final):   {kf['hr_final']:.4f}")
-        print(f"True HR (final):     {true_hr[-1]:.4f}")
-        print(f"Kalman HR std:       {kf['hr_std']:.6f}")
-        print(f"HR drift captured:   {kf['hedge_ratios'][50]:.3f} → {kf['hedge_ratios'][-1]:.3f}")
+    # 1. Adaptive Robust Z-score
+    print(f"\n--- Adaptive Robust Z-Score ---")
+    print(f"OU HL = {ou['halflife_ou']:.1f}ч → {hl_bars:.1f} bars (4h TF)")
 
-        # Hurst: OLS spread vs Kalman trading spread
-        h_ols = calculate_hurst_exponent(spread_ols)
-        h_kal = calculate_hurst_exponent(kf['spread'][30:])  # skip warmup
-        print(f"\nHurst OLS spread:    {h_ols:.4f}")
-        print(f"Hurst Kalman spread: {h_kal:.4f}")
-        print(f"  → Kalman {'лучше' if h_kal < h_ols else 'хуже'} (ниже = больше mean-reversion)")
+    z_old, zs_old = calculate_rolling_zscore(spread_mr, window=30)
+    z_new, zs_new, w_used = calculate_adaptive_robust_zscore(spread_mr, halflife_bars=hl_bars)
+    print(f"Old (window=30, std):  Z={z_old:+.3f}")
+    print(f"New (window={w_used}, MAD): Z={z_new:+.3f}")
 
-        # ADF
-        try:
-            from statsmodels.tsa.stattools import adfuller
-            _, p_ols, _, _, _, _ = adfuller(spread_ols, autolag='AIC')
-            _, p_kal, _, _, _, _ = adfuller(kf['spread'][30:], autolag='AIC')
-            print(f"ADF p-value OLS:     {p_ols:.6f}")
-            print(f"ADF p-value Kalman:  {p_kal:.6f}")
-        except ImportError:
-            print("(statsmodels not available for ADF test)")
+    # Test with different HL values
+    print(f"\nAdaptive windows for different HL:")
+    for hl in [2, 5, 10, 20, 50]:
+        _, _, w = calculate_adaptive_robust_zscore(spread_mr, halflife_bars=hl)
+        print(f"  HL={hl:>2d} bars → window={w}")
 
-        # Z-score comparison
-        z_ols, _ = calculate_rolling_zscore(spread_ols, window=30)
-        z_kal, _ = calculate_rolling_zscore(kf['spread'][30:], window=30)
-        print(f"\nRolling Z (OLS):     {z_ols:.3f}")
-        print(f"Rolling Z (Kalman):  {z_kal:.3f}")
+    # 2. Crossing Density
+    print(f"\n--- Crossing Density ---")
+    cd_mr = calculate_crossing_density(zs_new)
+    # Generate "stuck" spread
+    stuck = np.concatenate([np.ones(100) * 2, np.ones(100) * -1, np.ones(100) * 1.5])
+    cd_stuck = calculate_crossing_density(stuck)
+    print(f"Mean-reverting: density={cd_mr:.3f} ({'✅ active' if cd_mr > 0.03 else '❌ stuck'})")
+    print(f"Stuck spread:   density={cd_stuck:.3f} ({'✅ active' if cd_stuck > 0.03 else '❌ stuck'})")
 
-    # Delta selection
-    print("\n--- Delta Auto-Select ---")
-    best_d, best_res, all_ll = kalman_select_delta(s1, s2)
-    print(f"Best delta: {best_d}")
-    for d, ll in sorted(all_ll.items()):
-        marker = " ← best" if d == best_d else ""
-        print(f"  delta={d:.0e}: LL={ll:.1f}{marker}")
+    # 3. Rolling Correlation
+    print(f"\n--- Rolling Correlation ---")
+    s2 = np.cumsum(np.random.randn(n) * 0.3) + 100
+    s1 = 1.5 * s2 + np.random.randn(n) * 0.5 + 20
+    corr, corr_s = calculate_rolling_correlation(s1, s2, window=30)
+    print(f"Correlated pair: ρ={corr:.3f}")
+    s1_uncorr = np.cumsum(np.random.randn(n) * 0.3) + 50
+    corr_u, _ = calculate_rolling_correlation(s1_uncorr, s2, window=30)
+    print(f"Uncorrelated:    ρ={corr_u:.3f}")
 
-    # Sanitizer fix
-    print("\n--- Sanitizer (HR>100 fix) ---")
+    # 4. Sanitizer with min_bars + HR uncertainty
+    print(f"\n--- Sanitizer v10.1 ---")
     tests = [
-        (44349, 2, 4, -2.1),
-        (37543, 4, 4, 1.0),
-        (6750,  1, 4, 2.3),
-        (1.2,   3, 4, 2.0),
-        (-0.02, 3, 4, 1.5),
+        (1.2, 3, 4, 2.0, 300, 0.1, "normal 300 bars"),
+        (1.2, 3, 4, 2.0, 29,  0.1, "only 29 bars"),
+        (1.2, 3, 4, 2.0, 30,  0.1, "30 bars (boundary)"),
+        (0.0003, 2, 4, -2.3, 300, 0.0, "HR<0.001"),
+        (0.18, 3, 4, -1.8, 300, 0.25, "HR unc=139%"),
+        (0.18, 3, 4, -1.8, 300, 0.05, "HR unc=28%"),
     ]
-    for hr, sp, st, z in tests:
-        ok, reason = sanitize_pair(hr, sp, st, z)
-        print(f"  HR={hr:>10} Stab={sp}/{st} → {'✅' if ok else '❌'} {reason}")
+    for hr, sp, st, z, nb, hs, name in tests:
+        ok, reason = sanitize_pair(hr, sp, st, z, n_bars=nb, hr_std=hs)
+        print(f"  {name:<22s} → {'✅' if ok else '❌'} {reason}")
 
-    print("\n✅ v9.0.0 ready!")
+    # 5. Quality with crossing penalty + HR unc penalty
+    print(f"\n--- Quality Score v10.1 ---")
+    q1, bd1 = calculate_quality_score(0.2, ou, 0.01, 0.75, 1.5, True, crossing_density=0.08, hr_std=0.1)
+    q2, bd2 = calculate_quality_score(0.2, ou, 0.01, 0.75, 1.5, True, crossing_density=0.01, hr_std=0.1)
+    q3, bd3 = calculate_quality_score(0.2, ou, 0.01, 0.75, 1.5, True, crossing_density=0.08, hr_std=1.0)
+    print(f"Active/good HR: Q={q1} cross={bd1.get('crossing_penalty',0)} hr_unc={bd1.get('hr_unc_penalty',0)}")
+    print(f"Stuck/good HR:  Q={q2} cross={bd2.get('crossing_penalty',0)} hr_unc={bd2.get('hr_unc_penalty',0)}")
+    print(f"Active/bad HR:  Q={q3} cross={bd3.get('crossing_penalty',0)} hr_unc={bd3.get('hr_unc_penalty',0)}")
+
+    # 6. Min Q gate
+    print(f"\n--- Min Q Gate ---")
+    s1, d1, t1 = get_adaptive_signal(2.69, 'LOW', 8, '4h')
+    s2, d2, t2 = get_adaptive_signal(2.69, 'LOW', 25, '4h')
+    s3, d3, t3 = get_adaptive_signal(-1.83, 'HIGH', 63, '4h')
+    print(f"Q=8  LOW:  {s1} (expect NEUTRAL)")
+    print(f"Q=25 LOW:  {s2} (expect SIGNAL)")
+    print(f"Q=63 HIGH: {s3} (expect SIGNAL)")
+
+    print(f"\n✅ v10.1.0 ready!")

@@ -11,10 +11,13 @@ from statsmodels.regression.linear_model import OLS
 import warnings
 warnings.filterwarnings('ignore')
 
-# Импорт модуля mean reversion analysis v9.0
+# Импорт модуля mean reversion analysis v10.0
 from mean_reversion_analysis import (
     calculate_hurst_exponent,
     calculate_rolling_zscore,
+    calculate_adaptive_robust_zscore,
+    calculate_crossing_density,
+    calculate_rolling_correlation,
     calculate_ou_parameters,
     calculate_ou_score,
     calculate_quality_score,
@@ -244,16 +247,28 @@ class CryptoPairsScanner:
                 hr_series = None
                 use_kalman = False
 
-            # 3. Rolling Z-score
-            zscore, zscore_series = calculate_rolling_zscore(spread.values, window=30)
-
-            # 4. Half-life
+            # 3. Half-life из spread
             spread_lag = spread.shift(1)
             spread_diff = spread - spread_lag
             spread_diff = spread_diff.dropna()
             spread_lag = spread_lag.dropna()
             model_hl = OLS(spread_diff, spread_lag).fit()
             halflife = -np.log(2) / model_hl.params.iloc[0] if model_hl.params.iloc[0] < 0 else np.inf
+
+            # 4. v10: Adaptive Robust Z-score (MAD + HL-зависимое окно)
+            hours_per_bar = {'1h': 1, '2h': 2, '4h': 4, '1d': 24,
+                             '15m': 0.25}.get(self.timeframe, 4)
+            hl_hours = halflife * 24  # halflife в днях → часы
+            hl_bars = hl_hours / hours_per_bar if hl_hours < 9999 else None
+
+            zscore, zscore_series, z_window = calculate_adaptive_robust_zscore(
+                spread.values, halflife_bars=hl_bars
+            )
+
+            # v10: Rolling correlation (информационная)
+            corr, corr_series = calculate_rolling_correlation(
+                s1.values, s2.values, window=min(30, len(s1) // 3)
+            )
 
             return {
                 'pvalue': pvalue,
@@ -267,6 +282,8 @@ class CryptoPairsScanner:
                 'use_kalman': use_kalman,
                 'hr_std': hr_std,
                 'hr_series': hr_series,
+                'z_window': z_window,
+                'correlation': corr,
             }
         except Exception as e:
             return None
@@ -311,9 +328,9 @@ class CryptoPairsScanner:
                 if result:
                     all_pvalues.append(result['pvalue'])
                     
-                    # Сохраняем кандидатов (p < 0.10 для запаса)
+                    # Сохраняем кандидатов (p < 0.15 для запаса — v10 relaxed)
                     halflife_hours = result['halflife'] * 24
-                    if result['pvalue'] < 0.10 and halflife_hours <= max_halflife_hours:
+                    if result['pvalue'] < 0.15 and halflife_hours <= max_halflife_hours:
                         candidates.append((coin1, coin2, result, len(all_pvalues) - 1))
                 else:
                     all_pvalues.append(1.0)  # Не удалось — p=1
@@ -356,12 +373,18 @@ class CryptoPairsScanner:
                 price_data[coin1].values, price_data[coin2].values
             )
             
-            # [v8.1] Sanitizer — жёсткие исключения
+            # v10: количество баров
+            n_bars = len(result['spread']) if result.get('spread') is not None else 0
+            hr_std_val = result.get('hr_std', 0.0)
+            
+            # [v10.1] Sanitizer — жёсткие исключения (с min_bars + HR uncertainty)
             san_ok, san_reason = sanitize_pair(
                 hedge_ratio=result['hedge_ratio'],
                 stability_passed=stability['windows_passed'],
                 stability_total=stability['total_windows'],
-                zscore=result['zscore']
+                zscore=result['zscore'],
+                n_bars=n_bars,
+                hr_std=hr_std_val
             )
             if not san_ok:
                 continue
@@ -369,7 +392,13 @@ class CryptoPairsScanner:
             # [NEW] ADF-тест спреда
             adf = adf_test_spread(result['spread'])
             
-            # [NEW] Confidence
+            # [v10] Crossing Density — частота пересечений нуля
+            crossing_d = calculate_crossing_density(
+                result.get('zscore_series', np.array([])),
+                window=min(n_bars, 100)
+            )
+            
+            # [v10.1] Confidence (с HR uncertainty)
             confidence, conf_checks, conf_total = calculate_confidence(
                 hurst=hurst,
                 stability_score=stability['stability_score'],
@@ -377,10 +406,11 @@ class CryptoPairsScanner:
                 adf_passed=adf['is_stationary'],
                 zscore=result['zscore'],
                 hedge_ratio=result['hedge_ratio'],
-                hurst_is_fallback=hurst_is_fallback
+                hurst_is_fallback=hurst_is_fallback,
+                hr_std=hr_std_val
             )
             
-            # [D-B] Quality Score (пара)
+            # [v10.1] Quality Score (с HR uncertainty penalty)
             q_score, q_breakdown = calculate_quality_score(
                 hurst=hurst,
                 ou_params=ou_params,
@@ -388,7 +418,10 @@ class CryptoPairsScanner:
                 stability_score=stability['stability_score'],
                 hedge_ratio=result['hedge_ratio'],
                 adf_passed=adf['is_stationary'],
-                hurst_is_fallback=hurst_is_fallback
+                hurst_is_fallback=hurst_is_fallback,
+                crossing_density=crossing_d,
+                n_bars=n_bars,
+                hr_std=hr_std_val
             )
             
             # [v8.1] Signal Score (capped by Quality)
@@ -409,9 +442,8 @@ class CryptoPairsScanner:
             
             halflife_hours = result['halflife'] * 24
             
-            # v9.1: количество баров и Z-warning
-            n_bars = len(result['spread']) if result.get('spread') is not None else 0
-            z_warning = abs(result['zscore']) > 4.0  # approaching anomaly
+            # v10: Z-warning
+            z_warning = abs(result['zscore']) > 4.0
             
             results.append({
                 'pair': f"{coin1}/{coin2}",
@@ -458,9 +490,16 @@ class CryptoPairsScanner:
                 'use_kalman': result.get('use_kalman', False),
                 'hr_std': result.get('hr_std', 0.0),
                 'hr_series': result.get('hr_series'),
-                # v9.1
+                # v10: new metrics
                 'n_bars': n_bars,
                 'z_warning': z_warning,
+                'z_window': result.get('z_window', 30),
+                'crossing_density': crossing_d,
+                'correlation': result.get('correlation', 0.0),
+                # v10.1: HR uncertainty ratio
+                'hr_uncertainty': (hr_std_val / result['hedge_ratio']
+                                   if result['hedge_ratio'] > 0 and hr_std_val > 0
+                                   else 0.0),
             })
         
         # Сортируем: сначала по Signal (SIGNAL > READY > WATCH > NEUTRAL), потом по Quality
@@ -531,7 +570,7 @@ def plot_spread_chart(spread_data, pair_name, zscore):
 # === ИНТЕРФЕЙС ===
 
 st.markdown('<p class="main-header">🔍 Crypto Pairs Trading Scanner</p>', unsafe_allow_html=True)
-st.caption("Версия 4.1.0 | 17 февраля 2026 | HR floor + N bars + Z warning + Kalman HR + Sanitizers + TF-thresholds")
+st.caption("Версия 5.1.0 | 17 февраля 2026 | Min-Q gate + HR uncertainty + N-bars hard gate + Adaptive Z + Crossing Density + Kalman HR")
 st.markdown("---")
 
 # Sidebar - настройки
@@ -870,12 +909,14 @@ if st.session_state.pairs_data is not None:
             ),
             'HR': round(p['hedge_ratio'], 4),
             'N': p.get('n_bars', 0),
+            'Zw': p.get('z_window', 30),
+            'ρ': round(p.get('correlation', 0), 2),
         } for p in pairs])
     else:
         # Пустая таблица если нет пар
         df_display = pd.DataFrame(columns=[
             'Пара', 'Статус', 'Dir', 'Q', 'S', 'Conf', 'Z', 'Thr',
-            'FDR', 'ADF', 'KF', 'Hurst', 'Stab', 'HL', 'HR', 'N'
+            'FDR', 'ADF', 'KF', 'Hurst', 'Stab', 'HL', 'HR', 'N', 'Zw', 'ρ'
         ])
     
     # Функция для выбора строки
@@ -1007,7 +1048,7 @@ if st.session_state.pairs_data is not None:
     # ═══════ MEAN REVERSION ANALYSIS v8.0 ═══════
     if 'hurst' in selected_data and 'theta' in selected_data:
         st.markdown("---")
-        st.subheader("🔬 Mean Reversion Analysis (v8.0)")
+        st.subheader("🔬 Mean Reversion Analysis (v10.0)")
         
         col1, col2, col3, col4 = st.columns(4)
         
@@ -1032,7 +1073,17 @@ if st.session_state.pairs_data is not None:
         
         with col3:
             hr = selected_data['hedge_ratio']
-            hr_st = "✅ OK" if 0.2 <= abs(hr) <= 5.0 else "⚠️ Экстрем."
+            hr_unc = selected_data.get('hr_uncertainty', 0)
+            if hr_unc > 0.5:
+                hr_st = f"⚠️ ±{hr_unc:.0%}"
+            elif hr_unc > 0.2:
+                hr_st = f"🟡 ±{hr_unc:.0%}"
+            elif hr_unc > 0:
+                hr_st = f"✅ ±{hr_unc:.0%}"
+            elif 0.2 <= abs(hr) <= 5.0:
+                hr_st = "✅ OK"
+            else:
+                hr_st = "⚠️ Экстрем."
             st.metric("Hedge Ratio", f"{hr:.4f}", hr_st)
         
         with col4:
@@ -1076,6 +1127,21 @@ if st.session_state.pairs_data is not None:
             **Adaptive порог:** |Z| ≥ {threshold}
             ({conf} confidence → {'сниженный' if threshold < 2.0 else 'стандартный'} порог)
             """)
+        
+        # v10: дополнительные метрики
+        v10_col1, v10_col2, v10_col3 = st.columns(3)
+        with v10_col1:
+            zw = selected_data.get('z_window', 30)
+            st.metric("Z-окно", f"{zw} баров", "адаптивное (HL×2.5)")
+        with v10_col2:
+            cd = selected_data.get('crossing_density', 0)
+            cd_emoji = "🟢" if cd >= 0.05 else "🟡" if cd >= 0.03 else "🔴"
+            st.metric("Crossing Density", f"{cd:.3f} {cd_emoji}",
+                       "активный" if cd >= 0.03 else "застрял")
+        with v10_col3:
+            corr = selected_data.get('correlation', 0)
+            corr_emoji = "🟢" if corr >= 0.7 else "🟡" if corr >= 0.4 else "⚪"
+            st.metric("Корреляция (ρ)", f"{corr:.3f} {corr_emoji}")
     
     # График спреда
     if selected_data['spread'] is not None:
@@ -1303,6 +1369,6 @@ else:
 # Footer
 st.markdown("---")
 st.caption("⚠️ Disclaimer: Этот инструмент предназначен только для образовательных целей. Не является финансовой рекомендацией.")
-# VERSION: 4.1
+# VERSION: 5.1
 # LAST UPDATED: 2026-02-17
-# FEATURES: HR floor (<0.001), N bars indicator, Z>4 warning, Kalman Filter HR, sanitizers, TF-aware thresholds, Quality/Signal, DFA, ADF, FDR, 90d default
+# FEATURES: v10.1 — Min Q gate, HR uncertainty, N<30 hard exclude, Adaptive Robust Z (MAD+HL), Crossing Density, Correlation, Kalman HR, sanitizers, TF-aware
