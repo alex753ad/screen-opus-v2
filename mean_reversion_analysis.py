@@ -1,14 +1,14 @@
 """
 Модуль расчета Hurst Exponent и Ornstein-Uhlenbeck параметров
-ВЕРСИЯ v8.1.0: Sanitizers + TF-aware Thresholds + Signal Cap
+ВЕРСИЯ v9.0.0: Kalman Filter HR + Sanitizer fix + TF-aware
 
-Дата: 16 февраля 2026
+Дата: 17 февраля 2026
 
-ИЗМЕНЕНИЯ v8.1.0:
-  [NEW] sanitize_pair() — жёсткие фильтры: HR≤0, HR=0, Stab=0/N, |Z|>10
-  [NEW] TF-aware пороги: 1h строже, 4h базовый, 1d с min Q≥50
-  [NEW] Signal Score capped: S = min(raw_S, Q * 1.2)
-  Всё из v8: Quality/Signal Score, Adaptive Signal, DFA, ADF, FDR, Stability
+ИЗМЕНЕНИЯ v9.0.0:
+  [NEW] kalman_hedge_ratio() — адаптивный HR через Kalman Filter
+  [NEW] kalman_select_delta() — автоподбор delta по log-likelihood
+  [FIX] sanitize_pair() — добавлен |HR| > 100
+  Всё из v8.1: Sanitizers, TF-aware пороги, Quality/Signal Score, Signal Cap
 """
 
 import numpy as np
@@ -145,6 +145,158 @@ def calculate_ou_parameters(spread, dt=1.0):
         }
     except Exception:
         return None
+
+
+# =============================================================================
+# KALMAN FILTER для адаптивного HEDGE RATIO
+# =============================================================================
+
+def kalman_hedge_ratio(series1, series2, delta=1e-4, ve=1e-3):
+    """
+    Kalman Filter для динамического hedge ratio.
+
+    Модель:
+      State:  β_t = [intercept_t, hedge_ratio_t]
+      Transition: β_t = β_{t-1} + w_t,  w ~ N(0, Q)
+      Observation: price1_t = intercept_t + hedge_ratio_t * price2_t + v_t
+
+    Args:
+        series1, series2: ценовые ряды (np.array или pd.Series)
+        delta: дисперсия перехода (процесс случайного блуждания для β).
+               Маленький delta = гладкий HR, большой = быстрая адаптация.
+               Default 1e-4 — хороший баланс для 4h крипто.
+        ve: начальная дисперсия наблюдения (measurement noise).
+
+    Returns:
+        dict:
+            hedge_ratios:  np.array — HR на каждом баре
+            intercepts:    np.array — intercept на каждом баре
+            spread:        np.array — адаптивный спред
+            hr_final:      float — текущий (последний) HR
+            intercept_final: float
+            hr_std:        float — uncertainty текущего HR
+            sqrt_Q:        np.array — серия measurement prediction errors
+    """
+    s1 = np.array(series1, dtype=float)
+    s2 = np.array(series2, dtype=float)
+    n = min(len(s1), len(s2))
+
+    if n < 10:
+        return None
+
+    s1, s2 = s1[:n], s2[:n]
+
+    # State: [intercept, hedge_ratio]
+    # Начальная оценка через OLS на первых 30 барах
+    init_n = min(30, n // 3)
+    try:
+        X_init = np.column_stack([np.ones(init_n), s2[:init_n]])
+        beta_init = np.linalg.lstsq(X_init, s1[:init_n], rcond=None)[0]
+    except Exception:
+        beta_init = np.array([0.0, 1.0])
+
+    # Kalman state
+    beta = beta_init.copy()          # [2,] state estimate
+    P = np.eye(2) * 1.0              # [2,2] state covariance
+    Q = np.eye(2) * delta            # [2,2] transition noise
+    R = ve                            # scalar observation noise
+
+    # Storage
+    hedge_ratios = np.zeros(n)
+    intercepts = np.zeros(n)
+    innovations = np.zeros(n)    # Kalman innovations (≈ белый шум)
+    trading_spread = np.zeros(n) # Торговый спред для Z-score
+    sqrt_Q_series = np.zeros(n)
+
+    for t in range(n):
+        # Observation vector: x_t = [1, price2_t]
+        x_t = np.array([1.0, s2[t]])
+
+        # Predict
+        # beta = beta (random walk)
+        P = P + Q
+
+        # Update
+        y_hat = x_t @ beta                  # predicted price1
+        e_t = s1[t] - y_hat                 # innovation
+        S_t = x_t @ P @ x_t + R            # innovation variance
+        K_t = P @ x_t / S_t                 # Kalman gain [2,]
+
+        beta = beta + K_t * e_t             # state update
+        P = P - np.outer(K_t, x_t) @ P     # covariance update
+
+        # Ensure P stays positive definite
+        P = (P + P.T) / 2
+        np.fill_diagonal(P, np.maximum(np.diag(P), 1e-10))
+
+        # Store
+        intercepts[t] = beta[0]
+        hedge_ratios[t] = beta[1]
+        innovations[t] = e_t
+        # Торговый спред: price1 - HR_t * price2 - intercept_t
+        trading_spread[t] = s1[t] - beta[1] * s2[t] - beta[0]
+        sqrt_Q_series[t] = np.sqrt(max(S_t, 1e-10))
+
+    return {
+        'hedge_ratios': hedge_ratios,
+        'intercepts': intercepts,
+        'spread': trading_spread,       # ← для Z-score и DFA
+        'innovations': innovations,     # ← innovations (≈ белый шум)
+        'hr_final': float(hedge_ratios[-1]),
+        'intercept_final': float(intercepts[-1]),
+        'hr_std': float(np.sqrt(P[1, 1])),
+        'sqrt_Q': sqrt_Q_series,
+        'P_final': P,
+    }
+
+
+def kalman_select_delta(series1, series2, deltas=None):
+    """
+    Автоподбор delta по максимизации log-likelihood.
+
+    Перебирает несколько значений delta и выбирает лучший.
+    Используется если нет уверенности в default delta=1e-4.
+
+    Returns:
+        best_delta, best_result, all_likelihoods
+    """
+    if deltas is None:
+        deltas = [1e-5, 5e-5, 1e-4, 5e-4, 1e-3]
+
+    s1 = np.array(series1, dtype=float)
+    s2 = np.array(series2, dtype=float)
+    n = min(len(s1), len(s2))
+
+    best_ll = -np.inf
+    best_delta = 1e-4
+    best_result = None
+    all_ll = {}
+
+    for d in deltas:
+        res = kalman_hedge_ratio(s1, s2, delta=d)
+        if res is None:
+            continue
+
+        # Log-likelihood: sum of log N(e_t; 0, S_t)
+        sq = res['sqrt_Q']
+        innov = res['innovations']  # innovations, not trading spread
+
+        # Ignore first 30 bars (warmup)
+        warmup = min(30, n // 3)
+        ll_valid = -0.5 * np.sum(
+            np.log(2 * np.pi * sq[warmup:]**2 + 1e-10) +
+            innov[warmup:]**2 / (sq[warmup:]**2 + 1e-10)
+        )
+
+        all_ll[d] = float(ll_valid)
+        if ll_valid > best_ll:
+            best_ll = ll_valid
+            best_delta = d
+            best_result = res
+
+    return best_delta, best_result, all_ll
+
+
 
 
 # =============================================================================
@@ -390,18 +542,21 @@ def sanitize_pair(hedge_ratio, stability_passed, stability_total, zscore):
     Жёсткий фильтр: пара исключается полностью если не проходит.
 
     Исключения:
-      HR <= 0:       не арбитраж (обе ноги в одну сторону)
+      HR <= 0:       не арбитраж
       HR == 0:       OLS не нашёл связи
-      Stab 0/N:      коинтеграция не подтверждена НИ В ОДНОМ окне
+      |HR| > 100:    фактически односторонняя ставка
+      Stab 0/N:      коинтеграция не подтверждена ни в одном окне
       |Z| > 10:      сломанная модель
 
     Returns:
-        (passed, reason): True если OK, иначе причина исключения
+        (passed, reason)
     """
     if hedge_ratio <= 0:
         return False, f"HR={hedge_ratio:.4f} ≤ 0"
     if abs(hedge_ratio) < 1e-8:
         return False, "HR ≈ 0"
+    if abs(hedge_ratio) > 100:
+        return False, f"|HR|={abs(hedge_ratio):.0f} > 100"
     if stability_total > 0 and stability_passed == 0:
         return False, f"Stab=0/{stability_total}"
     if abs(zscore) > 10:
@@ -533,51 +688,74 @@ def validate_ou_quality(ou_params, hurst=None, min_theta=0.1, max_halflife=100):
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  v8.1.0 — Sanitizers + TF-aware + Signal Cap")
+    print("  v9.0.0 — Kalman Filter HR + Sanitizer fix")
     print("=" * 60)
     np.random.seed(42)
 
-    spread_mr = [0.0]
-    for i in range(250):
-        dx = 0.8 * (0 - spread_mr[-1]) + 0.5 * np.random.randn()
-        spread_mr.append(spread_mr[-1] + dx)
-    ou = calculate_ou_parameters(spread_mr, dt=1/6)
+    # Generate synthetic cointegrated pair
+    n = 500
+    s2 = np.cumsum(np.random.randn(n) * 0.5) + 50  # random walk asset 2
+    true_hr = np.linspace(1.2, 1.8, n)  # DRIFTING hedge ratio
+    noise = np.random.randn(n) * 0.3
+    s1 = true_hr * s2 + 5.0 + noise  # asset 1 = HR * asset2 + intercept + noise
 
-    # Sanitizer
-    print("\n--- Sanitizer ---")
+    # OLS (static)
+    from scipy import stats as sp_stats
+    slope_ols, intercept_ols, _, _, _ = sp_stats.linregress(s2, s1)
+    spread_ols = s1 - slope_ols * s2 - intercept_ols
+
+    # Kalman
+    print("\n--- Kalman vs OLS ---")
+    kf = kalman_hedge_ratio(s1, s2, delta=1e-4)
+    if kf:
+        print(f"OLS HR (static):     {slope_ols:.4f}")
+        print(f"Kalman HR (final):   {kf['hr_final']:.4f}")
+        print(f"True HR (final):     {true_hr[-1]:.4f}")
+        print(f"Kalman HR std:       {kf['hr_std']:.6f}")
+        print(f"HR drift captured:   {kf['hedge_ratios'][50]:.3f} → {kf['hedge_ratios'][-1]:.3f}")
+
+        # Hurst: OLS spread vs Kalman trading spread
+        h_ols = calculate_hurst_exponent(spread_ols)
+        h_kal = calculate_hurst_exponent(kf['spread'][30:])  # skip warmup
+        print(f"\nHurst OLS spread:    {h_ols:.4f}")
+        print(f"Hurst Kalman spread: {h_kal:.4f}")
+        print(f"  → Kalman {'лучше' if h_kal < h_ols else 'хуже'} (ниже = больше mean-reversion)")
+
+        # ADF
+        try:
+            from statsmodels.tsa.stattools import adfuller
+            _, p_ols, _, _, _, _ = adfuller(spread_ols, autolag='AIC')
+            _, p_kal, _, _, _, _ = adfuller(kf['spread'][30:], autolag='AIC')
+            print(f"ADF p-value OLS:     {p_ols:.6f}")
+            print(f"ADF p-value Kalman:  {p_kal:.6f}")
+        except ImportError:
+            print("(statsmodels not available for ADF test)")
+
+        # Z-score comparison
+        z_ols, _ = calculate_rolling_zscore(spread_ols, window=30)
+        z_kal, _ = calculate_rolling_zscore(kf['spread'][30:], window=30)
+        print(f"\nRolling Z (OLS):     {z_ols:.3f}")
+        print(f"Rolling Z (Kalman):  {z_kal:.3f}")
+
+    # Delta selection
+    print("\n--- Delta Auto-Select ---")
+    best_d, best_res, all_ll = kalman_select_delta(s1, s2)
+    print(f"Best delta: {best_d}")
+    for d, ll in sorted(all_ll.items()):
+        marker = " ← best" if d == best_d else ""
+        print(f"  delta={d:.0e}: LL={ll:.1f}{marker}")
+
+    # Sanitizer fix
+    print("\n--- Sanitizer (HR>100 fix) ---")
     tests = [
-        (1.2,   3, 4, 2.0),   # OK
-        (-0.02, 3, 4, 1.5),   # HR < 0
-        (0.0,   2, 4, 2.0),   # HR = 0
-        (5.0,   0, 4, 2.0),   # Stab 0/4
-        (1.0,   2, 4, 11.5),  # |Z| > 10
+        (44349, 2, 4, -2.1),
+        (37543, 4, 4, 1.0),
+        (6750,  1, 4, 2.3),
+        (1.2,   3, 4, 2.0),
+        (-0.02, 3, 4, 1.5),
     ]
     for hr, sp, st, z in tests:
         ok, reason = sanitize_pair(hr, sp, st, z)
-        print(f"  HR={hr:>8.4f} Stab={sp}/{st} Z={z:>5.1f} → {'✅' if ok else '❌'} {reason}")
+        print(f"  HR={hr:>10} Stab={sp}/{st} → {'✅' if ok else '❌'} {reason}")
 
-    # TF-aware thresholds
-    print("\n--- TF-aware Adaptive Signal ---")
-    cases = [
-        # (z, conf, q, tf)
-        (1.51,  "HIGH",   83, "1h"),  # NEAR/ENA — was SIGNAL, now WATCH (1h stricter)
-        (1.51,  "HIGH",   83, "4h"),  # Same pair on 4h — SIGNAL
-        (-2.85, "HIGH",   68, "4h"),  # ETH/BETH 4h — SIGNAL
-        (-1.6,  "HIGH",   63, "4h"),  # LIT/ATOM — SIGNAL
-        (4.38,  "HIGH",   90, "1d"),  # UMA/AR 1d HIGH — SIGNAL
-        (2.31,  "MEDIUM", 58, "1d"),  # MOVE/DOT 1d MED Q=58 — SIGNAL
-        (2.09,  "MEDIUM", 40, "1d"),  # VIRTUAL/ICP 1d MED Q=40 — needs Q>=50, so READY
-        (-3.86, "MEDIUM", 44, "1h"),  # SUI/SENT 1h MED — SIGNAL (>2.5)
-    ]
-    for z, conf, q, tf in cases:
-        state, dir, thr = get_adaptive_signal(z, conf, q, tf)
-        print(f"  Z={z:>+5.2f} {conf:6s} Q={q:>2} TF={tf:>2s} → {state:8s} {dir:5s} thr={thr}")
-
-    # Signal cap
-    print("\n--- Signal Cap by Quality ---")
-    s1, _ = calculate_signal_score(-3.86, ou, "MEDIUM", quality_score=44)
-    s2, _ = calculate_signal_score(-3.86, ou, "MEDIUM", quality_score=90)
-    print(f"  |Z|=3.86 MED Q=44 → S={s1} (capped at {int(44*1.2)})")
-    print(f"  |Z|=3.86 MED Q=90 → S={s2} (cap={int(90*1.2)}, no effect)")
-
-    print("\n✅ v8.1.0 ready!")
+    print("\n✅ v9.0.0 ready!")

@@ -11,7 +11,7 @@ from statsmodels.regression.linear_model import OLS
 import warnings
 warnings.filterwarnings('ignore')
 
-# Импорт модуля mean reversion analysis v8.1
+# Импорт модуля mean reversion analysis v9.0
 from mean_reversion_analysis import (
     calculate_hurst_exponent,
     calculate_rolling_zscore,
@@ -23,6 +23,8 @@ from mean_reversion_analysis import (
     calculate_confidence,
     get_adaptive_signal,
     sanitize_pair,
+    kalman_hedge_ratio,
+    kalman_select_delta,
     apply_fdr_correction,
     check_cointegration_stability,
     adf_test_spread,
@@ -103,7 +105,7 @@ if 'settings' not in st.session_state:
     st.session_state.settings = {
         'exchange': 'okx',          # OKX по умолчанию
         'timeframe': '4h',          # 4h таймфрейм
-        'lookback_days': 35,        # 35 дней
+        'lookback_days': 90,        # 90 дней (v9: увеличен для надёжности DFA и Kalman)
         'top_n_coins': 100,         # 100 монет
         'max_pairs_display': 30,    # 30 пар максимум
         'pvalue_threshold': 0.03,   # 0.03
@@ -189,7 +191,9 @@ class CryptoPairsScanner:
         """Получить исторические данные"""
         try:
             if limit is None:
-                limit = self.lookback_days
+                # Конвертируем дни в количество баров
+                bars_per_day = {'1h': 24, '4h': 6, '1d': 1, '2h': 12, '15m': 96}.get(self.timeframe, 6)
+                limit = self.lookback_days * bars_per_day
             
             ohlcv = self.exchange.fetch_ohlcv(symbol, self.timeframe, limit=limit)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -200,40 +204,57 @@ class CryptoPairsScanner:
             return None
     
     def test_cointegration(self, series1, series2):
-        """Тест на коинтеграцию (v6.0: с константой в OLS + rolling Z-score)"""
+        """
+        Тест на коинтеграцию v9.0:
+          1. Engle-Granger → p-value (статистическая значимость)
+          2. Kalman Filter → адаптивный HR + trading spread
+          3. Rolling Z-score на Kalman spread
+          4. Fallback на OLS если Kalman не сработал
+        """
         try:
-            # Убираем NaN
             valid_data = pd.concat([series1, series2], axis=1).dropna()
             if len(valid_data) < 20:
-                return None, None, None
-            
+                return None
+
             s1 = valid_data.iloc[:, 0]
             s2 = valid_data.iloc[:, 1]
-            
-            # Тест Энгла-Грейнджера
+
+            # 1. Engle-Granger (p-value)
             score, pvalue, _ = coint(s1, s2)
-            
-            # [B] Расчет hedge ratio С КОНСТАНТОЙ
-            s2_const = add_constant(s2)
-            model = OLS(s1, s2_const).fit()
-            hedge_ratio = model.params.iloc[1] if len(model.params) > 1 else model.params.iloc[0]
-            intercept = model.params.iloc[0] if len(model.params) > 1 else 0.0
-            
-            # Расчет спреда (с константой)
-            spread = s1 - hedge_ratio * s2 - intercept
-            
-            # [B] Rolling Z-score (без lookahead bias)
+
+            # 2. Kalman Filter для HR
+            kf = kalman_hedge_ratio(s1.values, s2.values, delta=1e-4)
+
+            if kf is not None and not np.isnan(kf['hr_final']) and abs(kf['hr_final']) < 1e6:
+                # Kalman path
+                hedge_ratio = kf['hr_final']
+                intercept = kf['intercept_final']
+                spread = pd.Series(kf['spread'], index=s1.index)
+                hr_std = kf['hr_std']
+                hr_series = kf['hedge_ratios']
+                use_kalman = True
+            else:
+                # Fallback: OLS
+                s2_const = add_constant(s2)
+                model = OLS(s1, s2_const).fit()
+                hedge_ratio = model.params.iloc[1] if len(model.params) > 1 else model.params.iloc[0]
+                intercept = model.params.iloc[0] if len(model.params) > 1 else 0.0
+                spread = s1 - hedge_ratio * s2 - intercept
+                hr_std = 0.0
+                hr_series = None
+                use_kalman = False
+
+            # 3. Rolling Z-score
             zscore, zscore_series = calculate_rolling_zscore(spread.values, window=30)
-            
-            # Расчет half-life
+
+            # 4. Half-life
             spread_lag = spread.shift(1)
             spread_diff = spread - spread_lag
             spread_diff = spread_diff.dropna()
             spread_lag = spread_lag.dropna()
-            
             model_hl = OLS(spread_diff, spread_lag).fit()
             halflife = -np.log(2) / model_hl.params.iloc[0] if model_hl.params.iloc[0] < 0 else np.inf
-            
+
             return {
                 'pvalue': pvalue,
                 'zscore': zscore,
@@ -242,7 +263,10 @@ class CryptoPairsScanner:
                 'intercept': intercept,
                 'halflife': halflife,
                 'spread': spread,
-                'score': score
+                'score': score,
+                'use_kalman': use_kalman,
+                'hr_std': hr_std,
+                'hr_series': hr_series,
             }
         except Exception as e:
             return None
@@ -399,10 +423,9 @@ class CryptoPairsScanner:
                 'halflife_days': result['halflife'],
                 'halflife_hours': halflife_hours,
                 'spread': result['spread'],
-                # v8: adaptive signal вместо get_signal
-                'signal': state,          # SIGNAL/READY/WATCH/NEUTRAL
-                'direction': direction,    # LONG/SHORT/NONE
-                'threshold': threshold,    # порог для этой пары
+                'signal': state,
+                'direction': direction,
+                'threshold': threshold,
                 'hurst': hurst,
                 'hurst_is_fallback': hurst_is_fallback,
                 'theta': ou_params['theta'] if ou_params else 0,
@@ -422,11 +445,15 @@ class CryptoPairsScanner:
                 'quality_breakdown': q_breakdown,
                 'signal_score': s_score,
                 'signal_breakdown': s_breakdown,
-                'trade_score': q_score,       # legacy compat
+                'trade_score': q_score,
                 'trade_breakdown': q_breakdown,
                 'confidence': confidence,
                 'conf_checks': conf_checks,
                 'conf_total': conf_total,
+                # v9: Kalman
+                'use_kalman': result.get('use_kalman', False),
+                'hr_std': result.get('hr_std', 0.0),
+                'hr_series': result.get('hr_series'),
             })
         
         # Сортируем: сначала по Signal (SIGNAL > READY > WATCH > NEUTRAL), потом по Quality
@@ -497,7 +524,7 @@ def plot_spread_chart(spread_data, pair_name, zscore):
 # === ИНТЕРФЕЙС ===
 
 st.markdown('<p class="main-header">🔍 Crypto Pairs Trading Scanner</p>', unsafe_allow_html=True)
-st.caption("Версия 3.1.0 | 16 февраля 2026 | Sanitizers + TF-thresholds + Quality/Signal + DFA + ADF + FDR")
+st.caption("Версия 4.0.0 | 17 февраля 2026 | Kalman HR + Sanitizers + TF-thresholds + Quality/Signal + DFA + ADF + FDR")
 st.markdown("---")
 
 # Sidebar - настройки
@@ -826,6 +853,7 @@ if st.session_state.pairs_data is not None:
             'Thr': p.get('threshold', 2.0),
             'FDR': '✅' if p.get('fdr_passed', False) else '❌',
             'ADF': '✅' if p.get('adf_passed', False) else '❌',
+            'KF': '🔷' if p.get('use_kalman', False) else '○',
             'Hurst': round(p.get('hurst', 0.5), 3),
             'Stab': f"{p.get('stability_passed', 0)}/{p.get('stability_total', 4)}",
             'HL': (
@@ -839,7 +867,7 @@ if st.session_state.pairs_data is not None:
         # Пустая таблица если нет пар
         df_display = pd.DataFrame(columns=[
             'Пара', 'Статус', 'Dir', 'Q', 'S', 'Conf', 'Z', 'Thr',
-            'FDR', 'ADF', 'Hurst', 'Stab', 'HL', 'HR'
+            'FDR', 'ADF', 'KF', 'Hurst', 'Stab', 'HL', 'HR'
         ])
     
     # Функция для выбора строки
@@ -1003,11 +1031,14 @@ if st.session_state.pairs_data is not None:
             adf_s = "✅" if selected_data.get('adf_passed', False) else "❌"
             stab = f"{selected_data.get('stability_passed', 0)}/{selected_data.get('stability_total', 4)}"
             stab_e = "✅" if selected_data.get('is_stable', False) else "⚠️"
+            kf_s = "🔷 Kalman" if selected_data.get('use_kalman', False) else "○ OLS"
+            hr_unc = selected_data.get('hr_std', 0)
             st.info(f"""
             **Проверки:**
             {fdr_s} FDR (p-adj={selected_data.get('pvalue_adj', 0):.4f})
             {adf_s} ADF (p={selected_data.get('adf_pvalue', 1.0):.4f})
             {stab_e} Стабильность: {stab} окон
+            **HR метод:** {kf_s} (±{hr_unc:.4f})
             """)
         
         with checks_col2:
@@ -1252,6 +1283,6 @@ else:
 # Footer
 st.markdown("---")
 st.caption("⚠️ Disclaimer: Этот инструмент предназначен только для образовательных целей. Не является финансовой рекомендацией.")
-# VERSION: 3.0
-# LAST UPDATED: 2026-02-16
-# FEATURES: Quality/Signal dual score, adaptive Z-thresholds, SIGNAL/READY/WATCH states, HR cutoff, DFA, ADF, FDR on all pairs, stability, confidence
+# VERSION: 4.0
+# LAST UPDATED: 2026-02-17
+# FEATURES: Kalman Filter HR, sanitizers (HR≤0/HR>100/Stab0), TF-aware thresholds, Quality/Signal dual score, adaptive Z-thresholds, DFA, ADF, FDR, stability, confidence, default 90d lookback
