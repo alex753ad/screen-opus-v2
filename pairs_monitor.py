@@ -113,8 +113,19 @@ if 'settings' not in st.session_state:
         'max_pairs_display': 30,    # 30 пар максимум
         'pvalue_threshold': 0.03,   # 0.03
         'zscore_threshold': 2.3,    # 2.3
-        'max_halflife_hours': 28    # 28 часов
+        'max_halflife_hours': 28,   # 28 часов
+        'hide_stablecoins': True,   # v10.4: скрыть стейблкоины / LST / wrapped
+        'corr_prefilter': 0.3,      # v10.4: пропускать пары с |ρ| < порога (0=выкл)
     }
+
+# v10.4: Стейблкоины, LST и wrapped-токены (торговля невыгодна из-за узкого спреда)
+STABLE_LST_TOKENS = {
+    'USDC', 'USDT', 'DAI', 'USDG', 'TUSD', 'BUSD', 'FDUSD', 'PYUSD',  # stablecoins
+    'STETH', 'BETH', 'CBETH', 'RETH', 'WSTETH', 'METH',                 # ETH LST
+    'JITOSOL', 'MSOL', 'BNSOL',                                          # SOL LST
+    'WBTC', 'TBTC',                                                       # wrapped BTC
+    'XAUT', 'PAXG',                                                       # gold tokens
+}
 
 class CryptoPairsScanner:
     def __init__(self, exchange_name='binance', timeframe='1d', lookback_days=30):
@@ -291,8 +302,9 @@ class CryptoPairsScanner:
         except Exception as e:
             return None
     
-    def scan_pairs(self, coins, max_pairs=50, progress_bar=None, max_halflife_hours=720):
-        """Сканировать все пары (v7.0: 2-pass FDR + ADF + Confidence)"""
+    def scan_pairs(self, coins, max_pairs=50, progress_bar=None, max_halflife_hours=720,
+                   hide_stablecoins=True, corr_prefilter=0.3):
+        """Сканировать все пары (v10.4: stablecoin filter + correlation pre-filter)"""
         
         # Загружаем данные
         st.info(f"📥 Загружаю данные для {len(coins)} монет...")
@@ -307,6 +319,31 @@ class CryptoPairsScanner:
         if len(price_data) < 2:
             st.error("❌ Недостаточно данных для анализа")
             return []
+        
+        # v10.4: Correlation pre-filter (ускорение в 3-5×)
+        skip_pairs = set()
+        if corr_prefilter > 0:
+            coin_list = list(price_data.keys())
+            # Align all series to common length
+            min_len = min(len(price_data[c]) for c in coin_list)
+            returns_dict = {}
+            for c in coin_list:
+                p = price_data[c].values[-min_len:]
+                r = np.diff(np.log(p + 1e-10))
+                returns_dict[c] = r
+            
+            for i, c1 in enumerate(coin_list):
+                for c2 in coin_list[i+1:]:
+                    rho = np.corrcoef(returns_dict[c1], returns_dict[c2])[0, 1]
+                    if abs(rho) < corr_prefilter:
+                        skip_pairs.add((c1, c2))
+            
+            if skip_pairs:
+                total_all = len(coin_list) * (len(coin_list) - 1) // 2
+                st.info(f"⚡ Корр. фильтр (|ρ| < {corr_prefilter}): пропущено {len(skip_pairs)}/{total_all} пар")
+        
+        # v10.4: Stablecoin/LST filter  
+        stable_skipped = 0
         
         total_combinations = len(price_data) * (len(price_data) - 1) // 2
         st.info(f"🔍 Фаза 1: Коинтеграция для {total_combinations} пар из {len(price_data)} монет...")
@@ -325,6 +362,24 @@ class CryptoPairsScanner:
                         processed / total_combinations * 0.5,  # Фаза 1 = 50%
                         f"Фаза 1: {processed}/{total_combinations}"
                     )
+                
+                # v10.4: Skip stablecoin/LST pairs (both coins must be stable to skip)
+                if hide_stablecoins:
+                    if coin1 in STABLE_LST_TOKENS and coin2 in STABLE_LST_TOKENS:
+                        all_pvalues.append(1.0)
+                        stable_skipped += 1
+                        continue
+                    # Пары типа ETH/STETH, SOL/JITOSOL — один актив + его LST
+                    c1u, c2u = coin1.upper(), coin2.upper()
+                    if (c1u in c2u or c2u in c1u) and (coin1 in STABLE_LST_TOKENS or coin2 in STABLE_LST_TOKENS):
+                        all_pvalues.append(1.0)
+                        stable_skipped += 1
+                        continue
+                
+                # v10.4: Skip uncorrelated pairs (pre-filter)
+                if (coin1, coin2) in skip_pairs:
+                    all_pvalues.append(1.0)
+                    continue
                 
                 result = self.test_cointegration(price_data[coin1], price_data[coin2])
                 
@@ -346,6 +401,8 @@ class CryptoPairsScanner:
         
         total_fdr_passed = int(np.sum(fdr_rejected))
         st.info(f"🔬 FDR: {total_fdr_passed} из {len(all_pvalues)} пар прошли (α=0.05)")
+        if stable_skipped > 0:
+            st.info(f"🚫 Пропущено {stable_skipped} стейблкоин/LST пар")
         
         # ═══════ ФАЗА 2: Дорогие метрики только для кандидатов ═══════
         st.info(f"🔍 Фаза 2: Детальный анализ {len(candidates)} кандидатов...")
@@ -602,7 +659,7 @@ def plot_spread_chart(spread_data, pair_name, zscore):
 # === ИНТЕРФЕЙС ===
 
 st.markdown('<p class="main-header">🔍 Crypto Pairs Trading Scanner</p>', unsafe_allow_html=True)
-st.caption("Версия 5.3.0 | 18 февраля 2026 | Stability gate + Z↓4.5 + NameError fix")
+st.caption("Версия 5.4.0 | 18 февраля 2026 | Stablecoin filter + Corr prefilter + Stability gate")
 st.markdown("---")
 
 # Sidebar - настройки
@@ -694,6 +751,28 @@ with st.sidebar:
     st.session_state.settings['max_halflife_hours'] = max_halflife_hours
     
     st.info(f"📊 Текущий фильтр: до {max_halflife_hours} часов ({max_halflife_hours/24:.1f} дней)")
+    
+    # v10.4: Фильтры мусорных пар
+    st.markdown("---")
+    st.subheader("🚫 Фильтры пар")
+    
+    hide_stablecoins = st.checkbox(
+        "Скрыть стейблкоины / LST / wrapped",
+        value=st.session_state.settings['hide_stablecoins'],
+        help="USDC/DAI, ETH/STETH, XAUT/PAXG — идеальная коинтеграция, но спред < 0.5% → убыточно",
+        key='hide_stable_chk'
+    )
+    st.session_state.settings['hide_stablecoins'] = hide_stablecoins
+    
+    corr_prefilter = st.slider(
+        "Корреляционный пре-фильтр",
+        min_value=0.0, max_value=0.6, 
+        value=st.session_state.settings['corr_prefilter'],
+        step=0.05,
+        help="Пропускать пары с |ρ| < порога. 0.3 = ускорение 3-5×. 0 = выкл.",
+        key='corr_prefilter_slider'
+    )
+    st.session_state.settings['corr_prefilter'] = corr_prefilter
     
     # НОВОЕ: Фильтры Hurst + OU Process
     st.markdown("---")
@@ -830,7 +909,9 @@ if st.session_state.running or (auto_refresh and st.session_state.pairs_data is 
                 top_coins, 
                 max_pairs=max_pairs_display, 
                 progress_bar=progress_bar,
-                max_halflife_hours=max_halflife_hours
+                max_halflife_hours=max_halflife_hours,
+                hide_stablecoins=st.session_state.settings['hide_stablecoins'],
+                corr_prefilter=st.session_state.settings['corr_prefilter'],
             )
             
             progress_placeholder.empty()
