@@ -1,15 +1,20 @@
 """
 Модуль расчета Hurst Exponent и Ornstein-Uhlenbeck параметров
-ВЕРСИЯ v10.3.0: Stability gate + Z↓4.5
+ВЕРСИЯ v10.5.0: Parallel download, HR cap↓30, DFA↑8, Conditional Z-cap, FDR gate
 
 Дата: 18 февраля 2026
 
-ИЗМЕНЕНИЯ v10.3.0:
-  [NEW] get_adaptive_signal() — stability_ratio < 0.5 (Stab < 2/4) → max WATCH
-  [FIX] get_adaptive_signal() — |Z| > 4.5 → NEUTRAL (was 5.0)
-  [FIX] Q gate↑40, HR ceiling↓50, N_min↑50 (from v10.2)
-  Всё из v10.1: Min-Q gate, HR uncertainty, N-bars hard gate
-  Всё из v10.0: Adaptive Robust Z, Crossing Density, Correlation, Kalman HR
+ИЗМЕНЕНИЯ v10.4.0:
+  [FIX] sanitize_pair() — HR cap: 50 → 30 (APT/ZORA HR=42 выходил через фильтр)
+  [FIX] DFA min_window: 4 → 8 (устраняет нестабильный Hurst на коротких рядах)
+  [NEW] get_adaptive_signal() — fdr_passed параметр: FDR fail + Q<60 → max READY
+  [NEW] get_adaptive_signal() — Z>4.5 условный: Q≥70 AND Stab≥3/4 → SIGNAL (EXTREME)
+  [FIX] Quality score: HR>10 penalty усилен (0 вместо 2)
+  
+  v10.3: Stability gate (Stab<2/4 → WATCH), Z cutoff 4.5
+  v10.2: Q gate↑40, HR ceiling, N_min↑50
+  v10.1: Min-Q gate, HR uncertainty, N-bars hard gate
+  v10.0: Adaptive Robust Z, Crossing Density, Correlation, Kalman HR
 """
 
 import numpy as np
@@ -20,8 +25,13 @@ from scipy import stats
 # HURST — DFA
 # =============================================================================
 
-def calculate_hurst_exponent(time_series, min_window=4):
-    """DFA на инкрементах. Возвращает 0.5 при fallback."""
+def calculate_hurst_exponent(time_series, min_window=8):
+    """DFA на инкрементах. Возвращает 0.5 при fallback.
+    
+    v10.4: min_window=8 (was 4). Меньшее значение давало нестабильные
+    результаты на 100-300 свечах, что приводило к Hurst=0.085 на 35d
+    и Hurst=0.5 (fallback) на 63d для одной и той же пары.
+    """
     ts = np.array(time_series, dtype=float)
     n = len(ts)
     if n < 30:
@@ -601,17 +611,17 @@ def calculate_quality_score(hurst, ou_params, pvalue_adj, stability_score,
     # ADF (15)
     bd['adf'] = 15 if adf_passed else 0
 
-    # Hedge ratio (15)
-    if hedge_ratio <= 0 or abs(hedge_ratio) > 50:
+    # Hedge ratio (15) — v10.4: steeper penalty for extreme HR
+    if hedge_ratio <= 0 or abs(hedge_ratio) > 30:
         bd['hedge_ratio'] = 0
     elif 0.2 <= abs(hedge_ratio) <= 5.0:
         bd['hedge_ratio'] = 15
     elif 0.1 <= abs(hedge_ratio) <= 10.0:
         bd['hedge_ratio'] = 10
-    elif 0.05 <= abs(hedge_ratio) <= 20.0:
-        bd['hedge_ratio'] = 5
+    elif 0.05 <= abs(hedge_ratio) <= 30.0:
+        bd['hedge_ratio'] = 5  # v10.4: covers 10-30 range
     else:
-        bd['hedge_ratio'] = 2
+        bd['hedge_ratio'] = 0
 
     # Crossing density modifier
     if crossing_density is not None and crossing_density < 0.03:
@@ -706,7 +716,7 @@ def sanitize_pair(hedge_ratio, stability_passed, stability_total, zscore,
     Исключения:
       HR <= 0:        не арбитраж
       |HR| < 0.001:   экономически бессмысленный HR
-      |HR| > 50:      фактически односторонняя ставка (50 единиц на 1)
+      |HR| > 30:      фактически односторонняя ставка (v10.4: was 50)
       Stab 0/N:       коинтеграция не подтверждена ни в одном окне
       |Z| > 10:       сломанная модель
       N < 50:         слишком мало данных для надёжной статистики
@@ -719,8 +729,8 @@ def sanitize_pair(hedge_ratio, stability_passed, stability_total, zscore,
         return False, f"HR={hedge_ratio:.4f} ≤ 0"
     if abs(hedge_ratio) < 0.001:
         return False, f"|HR|={abs(hedge_ratio):.6f} < 0.001"
-    if abs(hedge_ratio) > 50:
-        return False, f"|HR|={abs(hedge_ratio):.1f} > 50"
+    if abs(hedge_ratio) > 30:
+        return False, f"|HR|={abs(hedge_ratio):.1f} > 30 (v10.4)"
     if stability_total > 0 and stability_passed == 0:
         return False, f"Stab=0/{stability_total}"
     if abs(zscore) > 10:
@@ -741,15 +751,17 @@ def sanitize_pair(hedge_ratio, stability_passed, stability_total, zscore,
 # =============================================================================
 
 def get_adaptive_signal(zscore, confidence, quality_score, timeframe='4h',
-                        stability_ratio=1.0):
+                        stability_ratio=1.0, fdr_passed=True):
     """
     Адаптивный торговый сигнал с учётом таймфрейма.
 
-    v10.3: Hard guards (каскад):
-      |Z| > 4.5    → NEUTRAL (structural break / аномалия)
+    v10.4: Hard guards (каскад):
+      |Z| > 4.5 AND (Q<70 OR Stab<3/4) → NEUTRAL (структурный слом)
+      |Z| > 4.5 AND Q≥70 AND Stab≥3/4  → SIGNAL (extreme, но надёжная пара)
       Q < 30       → NEUTRAL (мусорная пара)
       Q < 40       → max READY (недостаточное качество для SIGNAL)
       Stab < 2/4   → max WATCH (коинтеграция не подтверждена в истории)
+      FDR fail + Q<60 → max READY (статистически ненадёжно)
 
     v8.1 TF-dependent thresholds:
       1h (шумный):  HIGH→2.0, MEDIUM→2.5, LOW→3.0
@@ -759,6 +771,7 @@ def get_adaptive_signal(zscore, confidence, quality_score, timeframe='4h',
     Args:
         stability_ratio: Доля окон где коинтеграция подтверждена (0.0–1.0).
                          0.25 = 1/4, 0.5 = 2/4, 0.75 = 3/4, 1.0 = 4/4.
+        fdr_passed: Прошёл ли FDR (Benjamini-Hochberg) коррекцию.
 
     Returns:
         (state, direction, threshold_used)
@@ -766,9 +779,14 @@ def get_adaptive_signal(zscore, confidence, quality_score, timeframe='4h',
     az = abs(zscore)
     direction = "LONG" if zscore < 0 else "SHORT" if zscore > 0 else "NONE"
 
-    # v10.3: Hard guards (каскад ужесточений)
+    # v10.4: Conditional Z-cap
     if az > 4.5:
-        return "NEUTRAL", "NONE", 4.5
+        # Только для надёжных пар (Q≥70 + Stab≥3/4) — позволяем extreme signal
+        if quality_score >= 70 and stability_ratio >= 0.75:
+            pass  # Пропускаем дальше к порогам — это потенциальный V-разворот
+        else:
+            return "NEUTRAL", "NONE", 4.5
+
     if quality_score < 30:
         return "NEUTRAL", "NONE", 99.0
 
@@ -802,6 +820,9 @@ def get_adaptive_signal(zscore, confidence, quality_score, timeframe='4h',
             return "WATCH", direction, t_signal
         # v10.2: Quality gate — Q < 40 → max READY
         if quality_score < 40:
+            return "READY", direction, t_signal
+        # v10.4: FDR gate — FDR fail + Q<60 → max READY (ненадёжная статистика)
+        if not fdr_passed and quality_score < 60:
             return "READY", direction, t_signal
         return "SIGNAL", direction, t_signal
     elif az >= t_ready:
