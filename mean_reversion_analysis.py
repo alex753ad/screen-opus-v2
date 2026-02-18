@@ -573,7 +573,7 @@ def calculate_quality_score(hurst, ou_params, pvalue_adj, stability_score,
 
     Модификаторы:
       Crossing density < 0.03 → -10 (спред застрял на одной стороне)
-      N < 50 баров → -15 (мало данных, ненадёжная статистика)
+      N < 100 баров → -15 (мало данных, ненадёжная статистика)
       HR uncertainty > 50% → -10 (Калман не уверен в хедже)
     """
     bd = {}
@@ -619,8 +619,8 @@ def calculate_quality_score(hurst, ou_params, pvalue_adj, stability_score,
     else:
         bd['crossing_penalty'] = 0
 
-    # Data depth modifier
-    if n_bars is not None and n_bars < 50:
+    # Data depth modifier (pairs with N<100 get penalty)
+    if n_bars is not None and n_bars < 100:
         bd['data_penalty'] = -15
     else:
         bd['data_penalty'] = 0
@@ -709,7 +709,7 @@ def sanitize_pair(hedge_ratio, stability_passed, stability_total, zscore,
       |HR| > 50:      фактически односторонняя ставка (50 единиц на 1)
       Stab 0/N:       коинтеграция не подтверждена ни в одном окне
       |Z| > 10:       сломанная модель
-      N < 30:         слишком мало данных для любой статистики
+      N < 50:         слишком мало данных для надёжной статистики
       HR uncertainty > 100%: Калман не уверен в связи
 
     Returns:
@@ -725,9 +725,9 @@ def sanitize_pair(hedge_ratio, stability_passed, stability_total, zscore,
         return False, f"Stab=0/{stability_total}"
     if abs(zscore) > 10:
         return False, f"|Z|={abs(zscore):.1f} > 10"
-    # v10.1: Hard minimum bars
-    if n_bars is not None and n_bars < 30:
-        return False, f"N={n_bars} < 30 баров"
+    # v10.2: Hard minimum bars
+    if n_bars is not None and n_bars < 50:
+        return False, f"N={n_bars} < 50 баров"
     # v10.1: HR uncertainty > 100% — Калман не нашёл стабильную связь
     if hr_std is not None and hr_std > 0 and hedge_ratio > 0:
         hr_unc = hr_std / hedge_ratio

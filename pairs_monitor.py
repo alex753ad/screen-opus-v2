@@ -529,7 +529,8 @@ class CryptoPairsScanner:
                 r['cluster'] = ', '.join(cluster_coins) if cluster_coins else ''
             
             if clusters:
-                cluster_msg = ', '.join(f"**{c}** ({n} пар)" for c, n in clusters.most_common())
+                sorted_clusters = sorted(clusters.items(), key=lambda x: -x[1])
+                cluster_msg = ', '.join(f"**{c}** ({n} пар)" for c, n in sorted_clusters)
                 st.warning(f"🔗 Кластеры в SIGNAL: {cluster_msg} — это не {sum(clusters.values())} независимых сделок!")
         else:
             for r in results:
@@ -599,7 +600,7 @@ def plot_spread_chart(spread_data, pair_name, zscore):
 # === ИНТЕРФЕЙС ===
 
 st.markdown('<p class="main-header">🔍 Crypto Pairs Trading Scanner</p>', unsafe_allow_html=True)
-st.caption("Версия 5.2.0 | 17 февраля 2026 | Q gate↑40 + HR ceiling↓50 + Cluster detect + TF-aware correlation")
+st.caption("Версия 5.2.1 | 18 февраля 2026 | Q gate↑40 + HR ceiling↓50 + Cluster detect fix + N_min↑50")
 st.markdown("---")
 
 # Sidebar - настройки
