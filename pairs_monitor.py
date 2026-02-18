@@ -436,11 +436,13 @@ class CryptoPairsScanner:
             )
             
             # [v8.1] Adaptive Signal (TF-aware)
+            stab_ratio = stability['stability_score']  # 0.0–1.0
             state, direction, threshold = get_adaptive_signal(
                 zscore=result['zscore'],
                 confidence=confidence,
                 quality_score=q_score,
-                timeframe=self.timeframe
+                timeframe=self.timeframe,
+                stability_ratio=stab_ratio
             )
             
             halflife_hours = result['halflife'] * 24
@@ -600,7 +602,7 @@ def plot_spread_chart(spread_data, pair_name, zscore):
 # === ИНТЕРФЕЙС ===
 
 st.markdown('<p class="main-header">🔍 Crypto Pairs Trading Scanner</p>', unsafe_allow_html=True)
-st.caption("Версия 5.2.1 | 18 февраля 2026 | Q gate↑40 + HR ceiling↓50 + Cluster detect fix + N_min↑50")
+st.caption("Версия 5.3.0 | 18 февраля 2026 | Stability gate + Z↓4.5 + NameError fix")
 st.markdown("---")
 
 # Sidebar - настройки
@@ -993,6 +995,10 @@ if st.session_state.pairs_data is not None:
         st.session_state.selected_pair_index = pair_options.index(selected_pair)
         
         selected_data = next(p for p in pairs if p['pair'] == selected_pair)
+    else:
+        # Нет пар — не показываем детальный анализ
+        st.info("📊 Запустите сканер для получения результатов")
+        st.stop()
     
     # ═══════ ЗАГОЛОВОК С АДАПТИВНЫМ СИГНАЛОМ ═══════
     state = selected_data.get('signal', 'NEUTRAL')

@@ -1,13 +1,13 @@
 """
 Модуль расчета Hurst Exponent и Ornstein-Uhlenbeck параметров
-ВЕРСИЯ v10.2.0: Q gate↑40, HR ceiling↓50
+ВЕРСИЯ v10.3.0: Stability gate + Z↓4.5
 
-Дата: 17 февраля 2026
+Дата: 18 февраля 2026
 
-ИЗМЕНЕНИЯ v10.2.0:
-  [FIX] get_adaptive_signal() — Q < 40 → max READY (was 25). Q < 30 → NEUTRAL (was 20)
-  [FIX] sanitize_pair() — |HR| > 50 → exclude (was 100)
-  [FIX] calculate_quality_score() — HR scoring aligned с ceiling 50
+ИЗМЕНЕНИЯ v10.3.0:
+  [NEW] get_adaptive_signal() — stability_ratio < 0.5 (Stab < 2/4) → max WATCH
+  [FIX] get_adaptive_signal() — |Z| > 4.5 → NEUTRAL (was 5.0)
+  [FIX] Q gate↑40, HR ceiling↓50, N_min↑50 (from v10.2)
   Всё из v10.1: Min-Q gate, HR uncertainty, N-bars hard gate
   Всё из v10.0: Adaptive Robust Z, Crossing Density, Correlation, Kalman HR
 """
@@ -740,18 +740,25 @@ def sanitize_pair(hedge_ratio, stability_passed, stability_total, zscore,
 # [v8.1] ADAPTIVE SIGNAL — TF-aware
 # =============================================================================
 
-def get_adaptive_signal(zscore, confidence, quality_score, timeframe='4h'):
+def get_adaptive_signal(zscore, confidence, quality_score, timeframe='4h',
+                        stability_ratio=1.0):
     """
     Адаптивный торговый сигнал с учётом таймфрейма.
 
-    v10.1: Hard guards:
-      Q < 20 → NEUTRAL (мусор не может быть SIGNAL/READY)
-      |Z| > 5 → NEUTRAL (аномалия)
+    v10.3: Hard guards (каскад):
+      |Z| > 4.5    → NEUTRAL (structural break / аномалия)
+      Q < 30       → NEUTRAL (мусорная пара)
+      Q < 40       → max READY (недостаточное качество для SIGNAL)
+      Stab < 2/4   → max WATCH (коинтеграция не подтверждена в истории)
 
     v8.1 TF-dependent thresholds:
       1h (шумный):  HIGH→2.0, MEDIUM→2.5, LOW→3.0
       4h (базовый): HIGH→1.5, MEDIUM→2.0, LOW→2.5
       1d (дневной): HIGH→1.5, MEDIUM→2.0, LOW→2.5 + min Q≥50
+
+    Args:
+        stability_ratio: Доля окон где коинтеграция подтверждена (0.0–1.0).
+                         0.25 = 1/4, 0.5 = 2/4, 0.75 = 3/4, 1.0 = 4/4.
 
     Returns:
         (state, direction, threshold_used)
@@ -759,16 +766,14 @@ def get_adaptive_signal(zscore, confidence, quality_score, timeframe='4h'):
     az = abs(zscore)
     direction = "LONG" if zscore < 0 else "SHORT" if zscore > 0 else "NONE"
 
-    # v10.2: Hard guards
-    if az > 5.0:
-        return "NEUTRAL", "NONE", 5.0
+    # v10.3: Hard guards (каскад ужесточений)
+    if az > 4.5:
+        return "NEUTRAL", "NONE", 4.5
     if quality_score < 30:
-        # Мусорная пара — даже при экстремальном Z не давать сигнал
         return "NEUTRAL", "NONE", 99.0
 
     # TF-зависимые пороги
     if timeframe == '1h':
-        # 1h шумнее — требуем больший Z
         if confidence == "HIGH" and quality_score >= 50:
             t_signal, t_ready, t_watch = 2.0, 1.5, 1.0
         elif confidence == "MEDIUM" and quality_score >= 40:
@@ -776,11 +781,9 @@ def get_adaptive_signal(zscore, confidence, quality_score, timeframe='4h'):
         else:
             t_signal, t_ready, t_watch = 3.0, 2.5, 2.0
     elif timeframe == '1d':
-        # 1d: как 4h, но требуем min Quality для SIGNAL
         if confidence == "HIGH" and quality_score >= 50:
             t_signal, t_ready, t_watch = 1.5, 1.2, 0.8
         elif confidence == "MEDIUM" and quality_score >= 50:
-            # На 1d MEDIUM нужен Q≥50 (а не 40)
             t_signal, t_ready, t_watch = 2.0, 1.5, 1.0
         else:
             t_signal, t_ready, t_watch = 2.5, 2.0, 1.5
@@ -794,11 +797,17 @@ def get_adaptive_signal(zscore, confidence, quality_score, timeframe='4h'):
             t_signal, t_ready, t_watch = 2.5, 2.0, 1.5
 
     if az >= t_signal:
-        # v10.2: Quality gate — SIGNAL requires minimum quality
+        # v10.3: Stability gate — Stab < 2/4 → max WATCH
+        if stability_ratio < 0.5:
+            return "WATCH", direction, t_signal
+        # v10.2: Quality gate — Q < 40 → max READY
         if quality_score < 40:
-            return "READY", direction, t_signal  # downgrade: too low quality for SIGNAL
+            return "READY", direction, t_signal
         return "SIGNAL", direction, t_signal
     elif az >= t_ready:
+        # v10.3: Stab < 2/4 → downgrade READY to WATCH
+        if stability_ratio < 0.5:
+            return "WATCH", direction, t_signal
         return "READY", direction, t_signal
     elif az >= t_watch:
         return "WATCH", direction, t_signal
@@ -944,13 +953,19 @@ if __name__ == "__main__":
     print(f"Stuck/good HR:  Q={q2} cross={bd2.get('crossing_penalty',0)} hr_unc={bd2.get('hr_unc_penalty',0)}")
     print(f"Active/bad HR:  Q={q3} cross={bd3.get('crossing_penalty',0)} hr_unc={bd3.get('hr_unc_penalty',0)}")
 
-    # 6. Min Q gate
-    print(f"\n--- Min Q Gate ---")
+    # 6. Signal gates: Q, Z, Stability
+    print(f"\n--- Signal Gates v10.3 ---")
     s1, d1, t1 = get_adaptive_signal(2.69, 'LOW', 8, '4h')
     s2, d2, t2 = get_adaptive_signal(2.69, 'LOW', 25, '4h')
     s3, d3, t3 = get_adaptive_signal(-1.83, 'HIGH', 63, '4h')
-    print(f"Q=8  LOW:  {s1} (expect NEUTRAL)")
-    print(f"Q=25 LOW:  {s2} (expect SIGNAL)")
-    print(f"Q=63 HIGH: {s3} (expect SIGNAL)")
+    s4, d4, t4 = get_adaptive_signal(2.5, 'MEDIUM', 56, '4h', stability_ratio=0.25)
+    s5, d5, t5 = get_adaptive_signal(2.5, 'MEDIUM', 56, '4h', stability_ratio=0.75)
+    s6, d6, t6 = get_adaptive_signal(4.8, 'LOW', 50, '4h')
+    print(f"Q=8  LOW:           {s1} (expect NEUTRAL)")
+    print(f"Q=25 LOW:           {s2} (expect NEUTRAL)")
+    print(f"Q=63 HIGH:          {s3} (expect SIGNAL)")
+    print(f"Q=56 Stab=1/4:      {s4} (expect WATCH)")
+    print(f"Q=56 Stab=3/4:      {s5} (expect SIGNAL)")
+    print(f"Z=4.8:              {s6} (expect NEUTRAL)")
 
-    print(f"\n✅ v10.1.0 ready!")
+    print(f"\n✅ v10.3.0 ready!")
